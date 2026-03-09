@@ -38,7 +38,7 @@ class OpenPi0Config(Pi0Config):
     # config for rl
     config_name: str = "pi0_libero"  # pi0_libero, pi05_libero, pi0_maniskill, pi05_maniskill, pi0_metaworld, pi05_metaworld
     num_images_in_input: int = 2  # number of images in input
-    noise_method: str = "flow_sde"  # flow_sde, flow_noise, flow_cps
+    noise_method: str = "flow_sde"  # flow_sde, flow_noise, flow_cps, fpo
     # noise config for flow-sde
     noise_level: float = 0.5
     noise_anneal: bool = False
@@ -78,6 +78,9 @@ class OpenPi0Config(Pi0Config):
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
 
+    # == fpo specific ==
+    use_fpo: bool = False  # Enable FPO training
+    fpo_num_train_samples: int = 5
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     """
@@ -313,6 +316,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        elif forward_type == ForwardType.FPO:      
+            return self.fpo_forward(**kwargs)
         else:
             raise NotImplementedError
 
@@ -460,6 +465,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             prev_values = outputs.get("prev_values")
             forward_action = noise_actions  # Used for SAC training
 
+            old_cfm_losses = None
+            tau_rollout = None
+            eps_rollout = None
+
         else:
             # Non-DSRL or eval mode
             outputs = self.sample_actions(
@@ -471,6 +480,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             prev_logprobs = outputs["prev_logprobs"]
             prev_values = outputs["prev_values"]
             forward_action = None
+            old_cfm_losses = outputs["old_cfm_losses"]
+            tau_rollout = outputs["tau_rollout"]
+            eps_rollout = outputs["eps_rollout"]
 
         forward_inputs = {
             "chains": outputs["chains"],
@@ -491,6 +503,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_logprobs": prev_logprobs,
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
+            "old_cfm_losses": old_cfm_losses,
+            "tau_rollout": tau_rollout,
+            "eps_rollout": eps_rollout,
         }
         return actions, result
 
@@ -594,8 +609,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values.append(value_t)
             chains.append(x_t)
             log_probs.append(log_prob)
-        x_0 = x_t
-        chains = torch.stack(chains, dim=1)
+        x_0 = x_t  #[bs, action_steps, action_dim]  ########  maybe
+        chains = torch.stack(chains, dim=1) # [bs, num_steps+1, action_steps, action_dim]  
         # post process for logprob
         log_probs = torch.stack(log_probs, dim=1)[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
@@ -612,12 +627,39 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values = values_vlm[:, None]
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
+
+        # fpo specific: add old cfm loss and rollout info
+        if self.config.use_fpo and mode == "train":
+            # bsize = x_0.shape[0]
+            fpo_num_train_samples = self.config.fpo_num_train_samples
+
+            cfm_x_0 = x_0 # shape: [bs, action_steps, action_dim]
+            
+            # Sample tau and epsilon
+            t_sample = torch.rand(bsize, fpo_num_train_samples, device=device)
+            eps_sample = torch.randn(bsize, fpo_num_train_samples, x_0.shape[1], x_0.shape[2], device=x_0.device)
+
+            initial_cfm_loss = self.compute_cfm_loss(
+                state, prefix_pad_masks, past_key_values, cfm_x_0, eps_sample, t_sample
+            )
+
+            old_cfm_losses = initial_cfm_loss.detach()
+            tau_rollout = t_sample.detach()
+            eps_rollout = eps_sample.detach()
+        else:
+            old_cfm_losses = None
+            tau_rollout = None
+            eps_rollout = None
+            
         return {
             "actions": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
             "prev_values": values,
             "denoise_inds": denoise_inds,
+            "old_cfm_losses": old_cfm_losses,
+            "tau_rollout": tau_rollout,
+            "eps_rollout": eps_rollout,
         }
 
     def sample_mean_var_val(
@@ -720,6 +762,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 x0_weight = 1 - (t_input - delta)
                 x1_weight = t_input - delta
                 x_t_std = self.noise_head(suffix_out)
+            elif self.config.noise_method == "fpo":
+                assert self.config.use_fpo, "FPO sampling requires pre-sampled noise input"
+                x0_weight = 1 - (t_input - delta)
+                x1_weight = t_input - delta
+                x_t_std = x_t_std = torch.zeros_like(t_input)
             else:
                 raise ValueError(f"Invalid noise method: {self.config.noise_method}")
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
@@ -1183,3 +1230,192 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if states.dtype != torch.bfloat16:
             states = states.to(torch.bfloat16)
         return states
+
+    
+    # ===== FPO-specific methods =====
+    def fpo_forward(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        **kwargs,
+    ) -> dict[str, Any]:
+        # get kwargs
+        compute_values = kwargs.get("compute_values", False)
+        chains = forward_inputs["chains"]
+        denoise_inds = forward_inputs["denoise_inds"]
+        # fpo things
+        eps_rollout = kwargs.get("eps_rollout", None)
+        tau_rollout = kwargs.get("tau_rollout", None)
+
+        # input transform
+        observation = self.input_transform(forward_inputs, transpose=False)
+        observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        # transfer to device
+        device = chains.device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+        # get log prob
+        log_probs, value_t, entropy, cfm_losses = self.get_log_prob_value_fpo(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            chains,
+            denoise_inds,
+            compute_values,
+            eps_rollout,
+            tau_rollout,
+        )
+        log_probs = log_probs[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        entropy = entropy[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        # post process
+        log_probs = log_probs.mean(dim=1)
+        entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[
+            :, None
+        ]  # [:,None] to align with loss-mask shape
+        value_t = value_t.mean(dim=-1, keepdim=False)
+        return {
+            "logprobs": log_probs,
+            "cfm_losses": cfm_losses,
+            "values": value_t,
+            "entropy": entropy,
+        }
+    
+    def get_log_prob_value_fpo(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        chains,
+        denoise_inds,
+        compute_values=False,
+        eps_rollout=None,
+        tau_rollout=None,
+    ):
+        bsize = state.shape[0]
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        # Compute image and language key value cache
+        [prefix_output, _], past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        chains_log_probs = []
+        chains_values = []
+        chains_entropy = []
+
+        # get log prob
+        if self.config.joint_logprob:
+            num_steps = self.config.num_steps
+            initial_log_prob = self.get_logprob_norm(
+                chains[:, 0],
+                torch.zeros_like(chains[:, 0]),
+                torch.ones_like(chains[:, 0]),
+            )
+            initial_entropy = self.gaussian_entropy(torch.ones_like(chains[:, 0]))
+            chains_log_probs.append(initial_log_prob)
+            chains_entropy.append(initial_entropy)
+        else:
+            num_steps = 1
+        for idx in range(num_steps):
+            denoise_ind = denoise_inds[:, idx]
+            chains_pre = chains[torch.arange(bsize), denoise_ind]
+            chains_next = chains[torch.arange(bsize), denoise_ind + 1]
+            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+                chains_pre,
+                denoise_ind,
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                "train",
+                self.config.num_steps,
+                compute_values,
+            )
+            log_probs = self.get_logprob_norm(chains_next, x_t_mean, x_t_std)
+            entropy = self.gaussian_entropy(x_t_std)
+            chains_log_probs.append(log_probs)
+            chains_entropy.append(entropy)
+            if not self.use_vlm_value:
+                chains_values.append(value_t)
+        if self.use_vlm_value:
+            chains_values.append(self.get_value_from_vlm(prefix_output))
+        chains_log_probs = torch.stack(chains_log_probs, dim=1)
+        chains_values = torch.stack(chains_values, dim=1)
+
+        # entropy is only available for flow-noise method
+        if self.config.noise_method == "flow_noise":
+            chains_entropy = torch.stack(chains_entropy, dim=1)
+        else:
+            chains_entropy = torch.zeros_like(chains_log_probs)
+
+        cfm_losses = self.compute_cfm_loss(
+            state, prefix_pad_masks, past_key_values, chains[:, -1], eps_rollout, tau_rollout
+        )
+        # TODO: check the order of values in chains
+        return chains_log_probs, chains_values, chains_entropy, cfm_losses
+    
+    def compute_cfm_loss(self, state, prefix_pad_masks, past_key_values, x_0, eps, t):
+        """
+        Calculate the CFM loss for FPO method.
+        """
+        bs = eps.shape[0]
+        N = eps.shape[1]
+
+        # Expand variables to match [B, N, action_steps, action_dim]
+        x_0 = x_0.unsqueeze(1).repeat(1, N, 1, 1)
+        t_expand = t.unsqueeze(-1).unsqueeze(-1).expand(
+            bs, N, x_0.shape[2], x_0.shape[3]
+        )
+        
+        # Calculate x_t based on the optimal transport schedule
+        x_t = t_expand * eps + (1 - t_expand) * x_0
+
+        vt_list = []
+        
+        # Iterate over the Monte Carlo samples
+        for idx_in in range(N):
+            # Predict velocity v_t
+            suffix_out = self.get_suffix_out(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t[:, idx_in, :, :],
+                t_expand[:, idx_in, 0, 0],
+            )
+            v_t = self.action_out_proj(suffix_out)  # [bs, action_steps, max_action_dim]
+            vt_list.append(v_t.unsqueeze(1))
+
+        v_t = torch.cat(vt_list, dim=1)
+        
+        # Truncate to the used action dimensions before calculating loss
+        x_0_used = x_0[:, :, : self.config.action_chunk, : self.config.action_env_dim]
+        eps_used = eps[:, :, : self.config.action_chunk, : self.config.action_env_dim]
+        v_t_used = v_t[:, :, : self.config.action_chunk, : self.config.action_env_dim]
+        
+        # Calculate CFM loss using MSE
+        cfm_losses = torch.nn.functional.mse_loss(
+            eps_used - x_0_used, v_t_used, reduction='none'
+        ).mean(dim=[2, 3])  # [B, N]
+
+        return cfm_losses

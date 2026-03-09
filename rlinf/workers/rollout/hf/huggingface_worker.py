@@ -344,11 +344,16 @@ class MultiStepRolloutWorker(Worker):
                     if self.collect_prev_infos
                     else None,
                     forward_inputs=result["forward_inputs"],
+                    # fpo specific
+                    old_cfm_losses=result.get("old_cfm_losses", None),
+                    tau_rollout=result.get("tau_rollout", None),
+                    eps_rollout=result.get("eps_rollout", None),
                     versions=torch.full_like(
                         result["prev_logprobs"],
                         float(self.version),
                         dtype=torch.float32,
                     )
+                    
                     if self.collect_versions
                     else None,
                 )
@@ -393,6 +398,9 @@ class MultiStepRolloutWorker(Worker):
                 prev_logprobs=None,
                 prev_values=result["prev_values"] if self.collect_prev_infos else None,
                 forward_inputs=None,
+                old_cfm_losses=None,
+                tau_rollout=None,
+                eps_rollout=None,
             )
 
             self.rollout_results[stage_id].append_step_result(chunk_step_result)

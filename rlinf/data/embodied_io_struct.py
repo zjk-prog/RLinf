@@ -254,6 +254,11 @@ class ChunkStepResult:
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
+    # fpo specific
+    old_cfm_losses: torch.Tensor = None  # [B, 1]
+    tau_rollout: torch.Tensor = None  # [B, num_train_samples]
+    eps_rollout: torch.Tensor = None  # [B, num_train_samples, action_dim]
+
     def __post_init__(self):
         if self.actions is not None:
             self.actions = self.actions.cpu().contiguous()
@@ -273,6 +278,12 @@ class ChunkStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.old_cfm_losses is not None:
+            self.old_cfm_losses = self.old_cfm_losses.cpu().contiguous()
+        if self.tau_rollout is not None:
+            self.tau_rollout = self.tau_rollout.cpu().contiguous()
+        if self.eps_rollout is not None:
+            self.eps_rollout = self.eps_rollout.cpu().contiguous()
 
 
 @dataclass
@@ -292,6 +303,12 @@ class Trajectory:
     truncations: torch.Tensor = None
     dones: torch.Tensor = None
     prev_logprobs: torch.Tensor = None
+
+    # for fpo
+    old_cfm_losses: torch.Tensor = None
+    tau_rollout: torch.Tensor = None
+    eps_rollout: torch.Tensor = None
+
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
@@ -426,6 +443,11 @@ class EmbodiedRolloutResult:
         default_factory=list
     )  # trajectory_length
 
+    # fpo specific
+    old_cfm_losses: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    tau_rollout: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    eps_rollout: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
@@ -451,6 +473,12 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs is not None:
             self.forward_inputs.append(result.forward_inputs)
+        if result.old_cfm_losses is not None:
+            self.old_cfm_losses.append(result.old_cfm_losses)
+        if result.tau_rollout is not None:
+            self.tau_rollout.append(result.tau_rollout)
+        if result.eps_rollout is not None:
+            self.eps_rollout.append(result.eps_rollout)
 
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
@@ -526,6 +554,20 @@ class EmbodiedRolloutResult:
             )
         if len(self.versions) > 0:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
+        # fpo specific
+        if len(self.old_cfm_losses) > 0:
+            trajectory.old_cfm_losses = (
+                torch.stack(self.old_cfm_losses, dim=0).cpu().contiguous()
+            )
+        if len(self.tau_rollout) > 0:
+            trajectory.tau_rollout = (
+                torch.stack(self.tau_rollout, dim=0).cpu().contiguous()
+            )
+        if len(self.eps_rollout) > 0:
+            trajectory.eps_rollout = (
+                torch.stack(self.eps_rollout, dim=0).cpu().contiguous()
+            )
+
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
             for key in trajectory.forward_inputs.keys():

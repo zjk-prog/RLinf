@@ -1365,6 +1365,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     forward_inputs = batch.get("forward_inputs", None)
 
+                    # fpo specific
+                    old_cfm_losses = batch.get("old_cfm_losses", None)
+                    tau_rollout = batch.get("tau_rollout", None)
+                    eps_rollout = batch.get("eps_rollout", None)
+
                     kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
@@ -1384,8 +1389,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
+                    is_fpo = self.cfg.algorithm.get("loss_type", "actor_critic").lower() == "fpo_actor_critic"
+                    forward_type = ForwardType.FPO if is_fpo else ForwardType.DEFAULT
+                    if is_fpo:
+                        kwargs["tau_rollout"] = tau_rollout
+                        kwargs["eps_rollout"] = eps_rollout
+
                     with self.amp_context:
                         output_dict = self.model(
+                            forward_type=forward_type,
                             forward_inputs=forward_inputs,
                             compute_logprobs=True,
                             compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
@@ -1422,6 +1434,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
                     }
+
+                    if is_fpo:
+                        kwargs["cfm_losses"] = output_dict.get("cfm_losses", None)
+                        kwargs["old_cfm_losses"] = old_cfm_losses
+
                     loss, metrics_data = policy_loss(**kwargs)
 
                     entropy_loss = torch.tensor(

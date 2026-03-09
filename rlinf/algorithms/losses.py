@@ -444,3 +444,171 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+def compute_fpo_actor_loss(
+    cfm_losses: torch.Tensor,
+    old_cfm_losses: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    advantages: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+    clip_ratio_c: Optional[float] = None,
+    loss_agg_func: Optional[Callable[..., torch.Tensor]] = None, # Expects masked_mean
+    max_episode_steps: Optional[int] = None,
+    loss_mask_sum: Optional[torch.Tensor] = None,
+    critic_warmup: Optional[bool] = False,
+    clip_log_ratio_min: Optional[float] = None,
+    clip_log_ratio_max: Optional[float] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute FPO actor loss function based on Flow Matching objective.
+
+    Args:
+        cfm_loss (torch.FloatTensor): Current conditional flow matching loss.
+        old_cfm_loss (torch.FloatTensor): Old conditional flow matching loss.
+        clip_ratio_low (float): Lower bound of clipping ratio.
+        clip_ratio_high (float): Upper bound of clipping ratio.
+        advantages (torch.FloatTensor): GAE (normalized) advantages.
+        loss_mask (Optional[torch.BoolTensor]): Mask for valid entries.
+        clip_ratio_c (Optional[float]): Optional clipping coefficient.
+        loss_agg_func (callable): Aggregation function (e.g., masked_mean).
+        max_episode_steps (Optional[int]): Max episode length for normalization.
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (actor_loss, metrics_dict)
+    """
+
+    loss_mask_ratio = None
+
+    if (
+        max_episode_steps is not None
+        and loss_mask_sum is not None
+        and loss_mask is not None
+    ):
+        loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
+        # Assuming masked_mean_ratio is globally accessible or passed in
+        # loss_agg_func = masked_mean_ratio 
+
+    if loss_mask is None:
+        loss_mask = torch.ones_like(cfm_losses).bool()
+
+    assert cfm_losses.dtype == torch.float32, (
+        "cfm_losses must be float32 to keep numerical stability"
+    )
+    assert old_cfm_losses.dtype == torch.float32, (
+        "old_cfm_losses must be float32 to keep numerical stability"
+    )
+    assert advantages.dtype == torch.float32, (
+        "advantages must be float32 to keep numerical stability"
+    )
+
+    loss_mask_count = loss_mask.count_nonzero() or 1
+    
+    # ---------------------------------------------------------
+    # FPO KEY DIFFERENCE: 
+    # log_ratio = old_cfm_loss - cfm_loss
+    # ---------------------------------------------------------
+    log_ratio = old_cfm_losses - cfm_losses
+    
+    if clip_log_ratio_min is not None:
+        log_ratio = torch.clamp(log_ratio, min=clip_log_ratio_min)
+    if clip_log_ratio_max is not None:
+        log_ratio = torch.clamp(log_ratio, max=clip_log_ratio_max)
+        
+    ratio = torch.where(loss_mask, torch.exp(log_ratio), 0)
+    approx_kl = torch.where(loss_mask, log_ratio.detach(), 0.0)
+
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    policy_loss1 = -advantages * ratio
+    policy_loss2 = -advantages * clipped_ratio
+
+    clip_mask = policy_loss1.detach() < policy_loss2.detach()
+
+    policy_loss = torch.max(policy_loss1, policy_loss2)
+    if clip_ratio_c is not None:
+        assert clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
+        policy_loss3 = torch.sign(advantages) * clip_ratio_c * advantages
+        dual_clip_mask = policy_loss3.detach() < policy_loss.detach()
+        policy_loss = torch.min(policy_loss, policy_loss3)
+    else:
+        dual_clip_mask = torch.zeros_like(clip_mask)
+
+    metric_policy_loss_abs = loss_agg_func(
+        policy_loss.abs(), loss_mask, loss_mask_ratio
+    ) if loss_agg_func else policy_loss.abs().mean()
+    
+    policy_loss = loss_agg_func(
+        policy_loss, loss_mask, loss_mask_ratio
+    ) if loss_agg_func else policy_loss.mean()
+
+    clip_mask = policy_loss1.detach() < policy_loss2.detach()
+    dual_clip_mask = (dual_clip_mask * loss_mask).bool()
+
+    clip_fraction = (clip_mask * loss_mask).sum() / float(loss_mask_count)
+    
+    # Approx KL divergence for FPO (expectation of log ratio)
+    approx_kl = -torch.sum(approx_kl) / float(loss_mask_count)
+
+    dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)
+
+    if critic_warmup:
+        policy_loss = torch.tensor(0.0, device=policy_loss.device)
+
+    # Compile metrics for logging
+    loss_mask_for_metrics = loss_mask
+    ratio_for_metrics = ratio.detach()
+    ratio_abs_for_metrics = (ratio - 1).abs().detach()
+    clipped_ratio_for_metrics = clipped_ratio.detach()
+    dual_cliped_ratio_for_metrics = dual_cliped_ratio.detach()
+
+    if len(ratio.shape) > 2 and loss_mask.shape[-1] == 1 and ratio.shape[-1] > 1:
+        loss_mask_for_metrics = loss_mask.expand_as(ratio)
+
+    metrics_data = {
+        "actor/fpo_policy_loss": policy_loss.detach(),
+        "actor/fpo_policy_loss_abs": metric_policy_loss_abs.detach(),
+        # Assuming masked_mean is used directly as in original code
+        "actor/fpo_ratio": (ratio_for_metrics * loss_mask_for_metrics).sum() / loss_mask_count, 
+        "actor/fpo_ratio_abs": (ratio_abs_for_metrics * loss_mask_for_metrics).sum() / loss_mask_count,
+        "actor/fpo_clipped_ratio": (clipped_ratio_for_metrics * loss_mask_for_metrics).sum() / loss_mask_count,
+        "actor/fpo_dual_cliped_ratio": (dual_cliped_ratio_for_metrics * loss_mask_for_metrics).sum() / loss_mask_count,
+        "actor/approx_kl": approx_kl.detach(),
+        "actor/clip_fraction": clip_fraction.detach(),
+    }
+    return policy_loss, metrics_data
+
+@register_policy_loss("fpo_actor_critic")
+def compute_fpo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
+    """
+    Compute FPO actor-critic loss function.
+
+    Args:
+        cfm_losses (torch.Tensor): Current conditional flow matching loss predictions
+        old_cfm_losses (torch.Tensor): Previous conditional flow matching loss
+        values (torch.Tensor): Current value predictions
+        advantages (torch.Tensor): Advantage values
+        returns (torch.Tensor): Return values
+        prev_values (torch.Tensor): Previous value predictions
+        clip_ratio_low (float): Lower clipping ratio for FPO
+        clip_ratio_high (float): Upper clipping ratio for FPO
+        value_clip (float): Value clipping threshold
+        huber_delta (float): Huber loss delta parameter
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: Loss and metrics dictionary
+    """
+    metrics_data = {}
+    
+    # Calculate FPO Actor Loss
+    actor_loss, actor_metrics_data = compute_fpo_actor_loss(**kwargs)
+    
+    # Reuse standard PPO Critic Loss
+    critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
+
+    loss = actor_loss + critic_loss
+    
+    metrics_data.update(actor_metrics_data)
+    metrics_data.update(critic_metrics_data)
+
+    return loss, metrics_data
