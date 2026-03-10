@@ -510,12 +510,15 @@ def compute_fpo_actor_loss(
     # log_ratio = old_cfm_loss - cfm_loss
     # ---------------------------------------------------------
     log_ratio = old_cfm_losses - cfm_losses
+    log_ratio = log_ratio.mean(dim=1)  # Average over num_train_samples dimension
     
     if clip_log_ratio_min is not None:
         log_ratio = torch.clamp(log_ratio, min=clip_log_ratio_min)
     if clip_log_ratio_max is not None:
         log_ratio = torch.clamp(log_ratio, max=clip_log_ratio_max)
-        
+    # print(f"[*******************************************]")
+    # print(f"loss_mask shape: {loss_mask.shape}, log_ratio shape: {log_ratio.shape}")  
+    # print(f"[*******************************************]")
     ratio = torch.where(loss_mask, torch.exp(log_ratio), 0)
     approx_kl = torch.where(loss_mask, log_ratio.detach(), 0.0)
 
