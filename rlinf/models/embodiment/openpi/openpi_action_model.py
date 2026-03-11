@@ -1416,6 +1416,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # Calculate CFM loss using MSE
         cfm_losses = torch.nn.functional.mse_loss(
             eps_used - x_0_used, v_t_used, reduction='none'
-        ).mean(dim=[2, 3])  # [B, N]
-
+        ).sum(dim=[2, 3])  # [B, N]
+        #TODO: change to sum
         return cfm_losses

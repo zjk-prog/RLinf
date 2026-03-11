@@ -22,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_ppo_openpi"
+    experiment_name: "baseline_libero_spatial_ppo_openpi"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -41,7 +41,7 @@ algorithm:
   group_size: 1
   reward_coef: 1.0
 
-  rollout_epoch: 8
+  rollout_epoch: 2
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level
@@ -88,7 +88,7 @@ env:
 
   # Override the default values in env/libero_spatial
   train:
-    total_num_envs: 64
+    total_num_envs: 32
     max_episode_steps: 240 # max episode steps for truncation
     max_steps_per_rollout_epoch: 240
   eval:
@@ -112,20 +112,20 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi0-SFT-Spatial-Object-Goal"
+    model_path: "/workspace/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 128
-  global_batch_size: 2048 # maximum : global batch size = micro batch size * actor num_processes.
+  micro_batch_size: 32
+  global_batch_size: 256 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
   enable_offload: False
 
   # Override the default values in model/pi0
   model:
-    model_path: "/path/to/model/RLinf-Pi0-SFT-Spatial-Object-Goal"
+    model_path: "/workspace/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     num_action_chunks: 5 # interface for the env
     add_value_head: True
     # openpi specific parameters
@@ -133,14 +133,14 @@ actor:
       detach_critic_input: True
 
   optim:
-    lr: 5.0e-6
+    lr: 1.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
-    critic_warmup_steps: 0
+    critic_warmup_steps: 3
 
   # Override the default values in training_backend/fsdp
   fsdp_config:
