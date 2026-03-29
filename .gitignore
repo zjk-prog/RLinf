@@ -32,3 +32,7 @@ venv/
 .venv/ckpt/
 *.safetensors
 *.pt
+*.png
+datasets/
+ManiSkill-GS/
+real_new_ctrl_pp_dice_10hz/
