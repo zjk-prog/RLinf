@@ -67,7 +67,10 @@ class RealSenseCamera(BaseCamera):
         self._align = rs.align(rs.stream.color)
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
-        frames = self._pipeline.wait_for_frames()
+        try:
+            frames = self._pipeline.wait_for_frames()
+        except RuntimeError:
+            return False, None
         aligned_frames = self._align.process(frames)
         color_frame = aligned_frames.get_color_frame()
         if self._enable_depth:
@@ -84,8 +87,15 @@ class RealSenseCamera(BaseCamera):
             return False, None
 
     def _close_device(self) -> None:
-        self._pipeline.stop()
-        self._config.disable_all_streams()
+        try:
+            self._pipeline.stop()
+        except RuntimeError:
+            # It is safe to ignore stop errors during reconnect/teardown.
+            pass
+        try:
+            self._config.disable_all_streams()
+        except RuntimeError:
+            pass
 
     @staticmethod
     def get_device_serial_numbers() -> set[str]:

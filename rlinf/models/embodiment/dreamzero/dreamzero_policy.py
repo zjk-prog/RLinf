@@ -16,7 +16,6 @@ import types
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import cv2
 import numpy as np
 import torch
 from groot.vla.data.transform import ComposedModalityTransform
@@ -48,7 +47,7 @@ class DreamZeroConfig(VLAConfig):
         default=None, metadata={"help": "Environment action dimension."}
     )
     num_action_chunks: int = field(
-        default=16, metadata={"help": "Number of action chunks."}
+        default=8, metadata={"help": "Number of action chunks."}
     )
 
     relative_action: bool = field(default=False, metadata={"help": "Relative action."})
@@ -87,6 +86,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
     ):
         super().__init__(config)
         self.config = config
+        # `signed`: gripper in {-1, 1}; `zero_one`: gripper in {0, 1}.
+        self._gripper_action_mode = "signed"
+        self._gripper_binary_threshold = 0.0
+        self._refresh_gripper_action_mode_from_metadata()
         try:
             diffusion_model = getattr(getattr(self, "action_head", None), "model", None)
             self._patch_causal_wan_model_forward_train(diffusion_model)
@@ -204,10 +207,102 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 normalized_input[k] = v.to(dtype=target_dtype)
         return normalized_input
 
+    def _refresh_gripper_action_mode_from_metadata(self) -> None:
+        """Infer gripper action convention from checkpoint metadata statistics."""
+        self._gripper_action_mode = "signed"
+        self._gripper_binary_threshold = 0.0
+        try:
+            metadata = getattr(self.config.data_transforms, "metadata", None)
+            if metadata is None:
+                metadata_dict = None
+            elif isinstance(metadata, dict):
+                metadata_dict = metadata
+            elif hasattr(metadata, "model_dump"):
+                metadata_dict = metadata.model_dump()
+            else:
+                metadata_dict = None
+
+            # Some metadata files are keyed by embodiment tag at the top level,
+            # e.g. {"real_panda_single_arm": {"statistics": ...}}.
+            if isinstance(metadata_dict, dict) and "statistics" not in metadata_dict:
+                embodiment_tag = getattr(self.config, "embodiment_tag", None)
+                if (
+                    isinstance(embodiment_tag, str)
+                    and embodiment_tag in metadata_dict
+                    and isinstance(metadata_dict[embodiment_tag], dict)
+                ):
+                    metadata_dict = metadata_dict[embodiment_tag]
+                elif len(metadata_dict) == 1:
+                    only_value = next(iter(metadata_dict.values()))
+                    if isinstance(only_value, dict):
+                        metadata_dict = only_value
+
+            if isinstance(metadata_dict, dict):
+                action_stats = (
+                    metadata_dict.get("statistics", {})
+                    .get("action", {})
+                    .get("actions", {})
+                )
+                mins = action_stats.get("min")
+                maxs = action_stats.get("max")
+                if mins is not None and maxs is not None:
+                    mins_arr = np.asarray(mins).reshape(-1)
+                    maxs_arr = np.asarray(maxs).reshape(-1)
+                    if mins_arr.size > 0 and maxs_arr.size > 0:
+                        min_g = float(mins_arr[-1])
+                        max_g = float(maxs_arr[-1])
+                        if min_g >= -1e-6 and max_g <= 1.0 + 1e-6:
+                            self._gripper_action_mode = "zero_one"
+                            self._gripper_binary_threshold = 0.5
+
+            # Optional explicit override from config:
+            # - "auto": use metadata inference
+            # - "signed" or "zero_one": force the convention
+            configured_mode = str(
+                getattr(self.config, "gripper_action_mode", "auto")
+            ).lower()
+            if configured_mode in {"signed", "zero_one"}:
+                self._gripper_action_mode = configured_mode
+                self._gripper_binary_threshold = (
+                    0.5 if configured_mode == "zero_one" else 0.0
+                )
+        except Exception:
+            # Keep signed fallback to preserve backward compatibility.
+            self._gripper_action_mode = "signed"
+            self._gripper_binary_threshold = 0.0
+
+    def _binarize_gripper_action(self, actions: np.ndarray) -> np.ndarray:
+        """Apply checkpoint-aligned binary convention for gripper action."""
+        if self._gripper_action_mode == "zero_one":
+            actions[..., -1] = np.where(
+                actions[..., -1] >= self._gripper_binary_threshold,
+                1.0,
+                0.0,
+            ).astype(actions.dtype)
+        else:
+            actions[..., -1] = np.where(
+                actions[..., -1] > self._gripper_binary_threshold,
+                1.0,
+                -1.0,
+            ).astype(actions.dtype)
+        return actions
+
     def _observation_convert(self, env_obs: dict) -> dict:
         """Convert environment observation to model input for end-effector control"""
         main = env_obs["main_images"]
         wrist = env_obs.get("wrist_images", None)
+        if wrist is None:
+            extra_views = env_obs.get("extra_view_images", None)
+            if extra_views is not None:
+                if torch.is_tensor(extra_views):
+                    extra_views = extra_views.detach().cpu().numpy()
+                else:
+                    extra_views = np.asarray(extra_views)
+                # RealWorld outputs [B, N, H, W, C] for multi-camera extra views.
+                if extra_views.ndim == 5:
+                    wrist = extra_views[:, 0]
+                elif extra_views.ndim == 4:
+                    wrist = extra_views
         states = env_obs.get("states", None)
         prompts = env_obs.get("task_descriptions", None)
         if torch.is_tensor(main):
@@ -221,35 +316,89 @@ class DreamZeroPolicy(VLA, BasePolicy):
             else:
                 wrist = np.asarray(wrist)
 
-        def _resize_bt_hwc_uint8(x, h=256, w=256):
-            # x: [B,H,W,C
-            B = x.shape[0]
-            out = np.empty((B, h, w, 3), dtype=np.uint8)
-            for b in range(B):
-                frame = x[b]
-                if frame.dtype != np.uint8:
-                    frame = frame.astype(np.uint8)
-                out[b] = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-            return out
+        expected_state_dim = None
+        try:
+            metadata = getattr(self.config.data_transforms, "metadata", None)
+            if metadata is not None:
+                if isinstance(metadata, dict):
+                    shape = (
+                        metadata.get("modalities", {})
+                        .get("state", {})
+                        .get("state", {})
+                        .get("shape", None)
+                    )
+                    if isinstance(shape, list) and len(shape) > 0:
+                        expected_state_dim = int(shape[-1])
+                else:
+                    modalities = getattr(metadata, "modalities", None)
+                    state_mod = getattr(modalities, "state", None)
+                    state_state = getattr(state_mod, "state", None)
+                    shape = getattr(state_state, "shape", None)
+                    if isinstance(shape, (list, tuple)) and len(shape) > 0:
+                        expected_state_dim = int(shape[-1])
+        except Exception:
+            pass
 
-        main = _resize_bt_hwc_uint8(main)
+        def _ensure_bt_hwc_uint8(x):
+            arr = np.asarray(x)
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            if arr.ndim != 4:
+                raise ValueError(
+                    "DreamZero expects image tensors with shape [B,H,W,C] (or [H,W,C]), "
+                    f"but got shape {arr.shape}."
+                )
+            if arr.dtype != np.uint8:
+                arr = arr.astype(np.uint8)
+            return arr
+
+        main = _ensure_bt_hwc_uint8(main)
         if wrist is not None:
-            wrist = _resize_bt_hwc_uint8(wrist)
+            wrist = _ensure_bt_hwc_uint8(wrist)
         if main.ndim == 4:
             main = main[:, None, ...]
         if wrist is not None and wrist.ndim == 4:
             wrist = wrist[:, None, ...]
-        if states is not None:
-            if torch.is_tensor(states):
-                s_np = states.detach().cpu().numpy()
-            else:
-                s_np = np.asarray(states)
+        if states is None:
+            expected_shape = (
+                f"[B,{expected_state_dim}]"
+                if expected_state_dim is not None
+                else "[B,D]"
+            )
+            raise ValueError(
+                "DreamZero requires env_obs['states'] for policy inference, "
+                f"but got None. Expected shape {expected_shape}."
+            )
+
+        if torch.is_tensor(states):
+            s_np = states.detach().cpu().numpy()
         else:
-            s_np = np.zeros((B, 8), dtype=np.float32)
+            s_np = np.asarray(states)
+
         if s_np.ndim == 1:
             s_np = s_np[None, :]
-        elif s_np.ndim > 2:
-            s_np = s_np.reshape(B, -1)
+        elif s_np.ndim == 3 and s_np.shape[1] == 1:
+            s_np = s_np[:, 0, :]
+        elif s_np.ndim != 2:
+            raise ValueError(
+                "DreamZero expects states with shape [B,D] (or [B,1,D]), "
+                f"but got shape {s_np.shape}."
+            )
+
+        if s_np.shape[0] != B:
+            raise ValueError(
+                "DreamZero batch size mismatch between images and states: "
+                f"images batch={B}, states batch={s_np.shape[0]}."
+            )
+
+        current_state_dim = s_np.shape[-1]
+        if expected_state_dim is not None and current_state_dim != expected_state_dim:
+            raise ValueError(
+                "DreamZero state dimension mismatch: "
+                f"got {current_state_dim}, expected {expected_state_dim}. "
+                "Refusing to silently truncate/pad state; please ensure metadata and env state are aligned."
+            )
+
         s_np = s_np.astype(np.float32)
         state_bt = s_np[:, None, :]
         prompts = prompts if prompts is not None else [""] * B
@@ -258,9 +407,13 @@ class DreamZeroPolicy(VLA, BasePolicy):
         converted_obs = {
             "video.image": main,  # [B,H,W,C]
             "video.wrist_image": wrist,  # [B,H,W,C]
-            "state.state": state_bt,  # [B,1,8]
+            "state.state": state_bt,  # [B,1,D]
             "annotation.language.action_text": list(prompts),  # list[str], len=B
         }
+        print(f"{main.shape=}")
+        print(f"{wrist.shape=}")
+        print(f"{state_bt.shape=}")
+        print(f"{prompts=}")
         return converted_obs
 
     def predict_action_batch(self, env_obs, mode, **kwargs) -> np.ndarray:
@@ -291,9 +444,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
         batch.act = unnormalized_action
 
         actions = batch.act["action.actions"]
+        print("----- DreamZero raw action output -----")
+        print(actions)
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
-        actions[..., -1] = np.where(actions[..., -1] > 0, 1.0, -1.0).astype(
+        actions[..., -1] = np.where(actions[..., -1] > 0.5, 1.0, 0).astype(
             actions.dtype
         )
 
@@ -312,6 +467,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
             "prev_values": torch.zeros((flat.shape[0], 1), dtype=torch.float32),
             "forward_inputs": forward_inputs,
         }
+        print("----- DreamZero final action output -----")
+        #actions = actions[:,:16,:]
+        print(actions)
         return actions, result
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):

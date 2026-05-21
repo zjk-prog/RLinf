@@ -173,36 +173,51 @@ class FrankaBinRelocationEnv(FrankaEnv):
         return pose
 
     def _crop_frame(self, name, image):
-        """Crop realsense images to be a square."""
-        return image[:, 80:560, :]
+        """Return raw frame for policy; no task-specific center-crop."""
+        return image
 
     def _get_camera_frames(self):
-        images = {}
-        display_images = {}
-        for camera in self._cameras:
+        max_retries = 3
+        for retry_idx in range(max_retries):
+            images = {}
+            display_images = {}
             try:
-                rgb = camera.get_frame()
-                cropped_rgb = self._crop_frame(camera.name, rgb)
-                resized = cv2.resize(
-                    cropped_rgb,
-                    self.observation_space["frames"][camera.name].shape[:2][::-1],
-                )
-                images[camera.name] = resized[..., ::-1]
-                display_images[camera.name] = resized
-                if camera.name == "front":
-                    display_images[camera.name + "_full"] = cv2.resize(
-                        cropped_rgb, (480, 480)
-                    )
-                elif camera.name == "wrist_1":
-                    display_images[camera.name + "_full"] = cropped_rgb
-            except queue.Empty:
-                time.sleep(5)
-                camera.close()
-                self._open_cameras()
-                return self._get_camera_frames()
+                for camera in self._cameras:
+                    rgb = camera.get_frame()
+                    cropped_rgb = self._crop_frame(camera.name, rgb)
+                    target_size = self.observation_space["frames"][camera.name].shape[:2][::-1]
+                    if (
+                        cropped_rgb.shape[1] == target_size[0]
+                        and cropped_rgb.shape[0] == target_size[1]
+                    ):
+                        resized = cropped_rgb
+                    else:
+                        resized = cv2.resize(cropped_rgb, target_size)
+                    images[camera.name] = resized[..., ::-1]
+                    display_images[camera.name] = resized
+                    if camera.name == "front":
+                        display_images[camera.name + "_full"] = cv2.resize(
+                            cropped_rgb, (480, 480)
+                        )
+                    elif camera.name == "wrist_1":
+                        display_images[camera.name + "_full"] = cropped_rgb
 
-        self.camera_player.put_frame(display_images)
-        return images
+                self.camera_player.put_frame(display_images)
+                return images
+            except queue.Empty:
+                self._logger.warning(
+                    "Camera frame timeout (attempt %d/%d). Reopening all cameras.",
+                    retry_idx + 1,
+                    max_retries,
+                )
+                time.sleep(2)
+                self._close_cameras()
+                self._open_cameras()
+
+        raise RuntimeError(
+            "Failed to get camera frames after reconnect retries. "
+            "Please check RealSense cable/power and whether cameras are used by another process."
+        )
 
     def task_graph(self, obs=None):
         if obs is None:

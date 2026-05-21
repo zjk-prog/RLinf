@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 from pathlib import Path
 
@@ -64,6 +65,34 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     with open(config_path) as f:
         config_dict = json.load(f)
 
+    # Backward compatibility: only drop legacy diffusion keys when the current
+    # DreamZero source truly does not support them.
+    diffusion_cfg = (
+        config_dict.get("action_head_cfg", {})
+        .get("config", {})
+        .get("diffusion_model_cfg", {})
+    )
+    if isinstance(diffusion_cfg, dict) and "concat_first_frame_latent" in diffusion_cfg:
+        supports_concat_flag = True
+        try:
+            from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import (  # noqa: E501
+                CausalWanModel,
+            )
+
+            supports_concat_flag = (
+                "concat_first_frame_latent"
+                in inspect.signature(CausalWanModel.__init__).parameters
+            )
+        except Exception:
+            # Keep checkpoint key by default when introspection fails.
+            supports_concat_flag = True
+
+        if not supports_concat_flag:
+            get_logger().warning(
+                "Dropping unsupported DreamZero diffusion config key: concat_first_frame_latent"
+            )
+            diffusion_cfg.pop("concat_first_frame_latent", None)
+
     dreamzero_config = DreamZeroConfig(**config_dict)
 
     st = model_path / "model.safetensors"
@@ -83,14 +112,69 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     dreamzero_config.env_action_dim = cfg.get("action_dim", 7)
     dreamzero_config.gradient_checkpointing = cfg.get("gradient_checkpointing", False)
+    # Runtime overrides from RLinf actor config must be forwarded explicitly,
+    # otherwise DreamZeroPolicy falls back to metadata auto-detection/defaults.
+    dreamzero_config.gripper_action_mode = cfg.get("gripper_action_mode", "auto")
+    dreamzero_config.embodiment_tag = cfg.get("embodiment_tag", "libero_sim")
 
     exp_cfg_dir = model_path / "experiment_cfg"
     metadata_path = exp_cfg_dir / "metadata.json"
     with open(metadata_path, "r") as f:
         metadatas = json.load(f)
 
-    embodiment_tag = cfg.get("embodiment_tag", "libero_sim")
-    metadata = DatasetMetadata.model_validate(metadatas[embodiment_tag])
+    embodiment_tag = dreamzero_config.embodiment_tag
+    metadata_dict = metadatas[embodiment_tag]
+
+    # Align state metadata shape with available state statistics in checkpoint metadata.
+    # This keeps deployment generic across checkpoints with different state dimensions.
+    modalities_state = (
+        metadata_dict.get("modalities", {})
+        .get("state", {})
+        .get("state", {})
+    )
+    declared_shape = modalities_state.get("shape", None)
+    declared_state_dim = None
+    if isinstance(declared_shape, list) and len(declared_shape) > 0:
+        try:
+            declared_state_dim = int(declared_shape[-1])
+        except Exception:
+            declared_state_dim = None
+
+    state_stats = (
+        metadata_dict.get("statistics", {})
+        .get("state", {})
+        .get("state", {})
+    )
+    stats_state_dim = None
+    if isinstance(state_stats, dict):
+        for key in ("mean", "std", "q01", "q99", "min", "max"):
+            values = state_stats.get(key)
+            if isinstance(values, list) and len(values) > 0:
+                stats_state_dim = len(values)
+                break
+
+    target_state_dim = stats_state_dim or declared_state_dim
+
+    if isinstance(state_stats, dict) and isinstance(stats_state_dim, int):
+        for key in ("mean", "std", "q01", "q99", "min", "max"):
+            values = state_stats.get(key)
+            if isinstance(values, list) and len(values) != stats_state_dim:
+                raise ValueError(
+                    "DreamZero state statistics entry has wrong dimension: "
+                    f"statistics.state.state.{key} length={len(values)}, "
+                    f"expected {stats_state_dim}."
+                )
+
+    if isinstance(target_state_dim, int) and declared_state_dim != target_state_dim:
+        get_logger().warning(
+            "Adjusting DreamZero state shape from %s to %d for embodiment '%s' to match state statistics.",
+            declared_state_dim,
+            target_state_dim,
+            embodiment_tag,
+        )
+        modalities_state["shape"] = [target_state_dim]
+
+    metadata = DatasetMetadata.model_validate(metadata_dict)
 
     train_cfg = OmegaConf.load(exp_cfg_dir / "conf.yaml")
     train_cfg.transforms[embodiment_tag].transforms[-1].tokenizer_path = tokenizer_path

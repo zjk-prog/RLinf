@@ -5,9 +5,11 @@ set -euo pipefail
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
-
-export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
+export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
+export PYTHONPATH="${DREAMZERO_PATH}:${REPO_PATH}:${PYTHONPATH:-}"
 export HYDRA_FULL_ERROR=1
+export RAY_TMPDIR=${RAY_TMPDIR:-"/data/shiliangzhi/ray_tmp"}
+mkdir -p "${RAY_TMPDIR}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <config_name> [hydra_overrides...]" >&2
@@ -20,6 +22,7 @@ shift
 EXTRA_ARGS=("$@")
 
 echo "Using Python at $(which python)"
+echo "Using RAY_TMPDIR=${RAY_TMPDIR}"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
 MEGA_LOG_FILE="${LOG_DIR}/run_realworld_eval.log"
 mkdir -p "${LOG_DIR}"

@@ -25,6 +25,7 @@ class VideoPlayer:
     def __init__(self, enable: bool = True):
         self.queue = queue.Queue()
         self.is_running = False
+        self._run_thread = None
         if not enable:
             return
         self._run_thread = threading.Thread(target=self._play, daemon=True)
@@ -50,6 +51,29 @@ class VideoPlayer:
             frame = np.concatenate(
                 [v for k, v in img_array.items() if "full" not in k], axis=0
             )
+            try:
+                cv2.imshow("Cameras", frame)
+                cv2.waitKey(1)
+            except cv2.error as exc:
+                warnings.warn(
+                    "OpenCV GUI backend is unavailable. VideoPlayer will stop. "
+                    f"Original error: {exc}"
+                )
+                break
 
-            cv2.imshow("Cameras", frame)
-            cv2.waitKey(1)
+        self.is_running = False
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+
+    def stop(self):
+        if self._run_thread is None:
+            return
+
+        # Signal the player thread to exit and wait briefly for cleanup.
+        self.queue.put(None)
+        if self._run_thread.is_alive():
+            self._run_thread.join(timeout=1.0)
+
+        self.is_running = False

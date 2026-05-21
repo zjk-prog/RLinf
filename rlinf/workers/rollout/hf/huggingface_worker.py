@@ -98,6 +98,7 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
+        self._ensure_and_log_model_device(self.hf_model, model_name="rollout")
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -111,6 +112,7 @@ class MultiStepRolloutWorker(Worker):
                     self.cfg.rollout.expert_model.model_path
                 )
             self.expert_model = get_model(expert_model_config)
+            self._ensure_and_log_model_device(self.expert_model, model_name="expert")
 
             if self.cfg.runner.get("expert_ckpt_path", None):
                 expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
@@ -157,6 +159,45 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def _ensure_and_log_model_device(self, model: BasePolicy, model_name: str) -> None:
+        first_param = next(model.parameters(), None)
+        expected_device_type = self.torch_device_type
+
+        if first_param is None:
+            self.log_warning(f"{model_name} model has no parameters to inspect.")
+            return
+
+        if (
+            expected_device_type is not None
+            and first_param.device.type != expected_device_type
+        ):
+            self.log_warning(
+                f"{model_name} model is on {first_param.device}, expected {expected_device_type}. "
+                "Moving model to expected device."
+            )
+            model.to(expected_device_type)
+            first_param = next(model.parameters(), first_param)
+
+        total_param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        total_param_gb = total_param_bytes / (1024**3)
+
+        if first_param.device.type == "cuda":
+            device_idx = first_param.device.index
+            if device_idx is None:
+                device_idx = int(self.device)
+            alloc_gb = torch.cuda.memory_allocated(device_idx) / (1024**3)
+            reserved_gb = torch.cuda.memory_reserved(device_idx) / (1024**3)
+            self.log_info(
+                f"{model_name} model device={first_param.device}, "
+                f"param_size={total_param_gb:.2f} GiB, "
+                f"cuda_allocated={alloc_gb:.2f} GiB, cuda_reserved={reserved_gb:.2f} GiB"
+            )
+        else:
+            self.log_warning(
+                f"{model_name} model is on CPU ({first_param.device}). "
+                f"Estimated param_size={total_param_gb:.2f} GiB."
+            )
 
     def setup_sample_params(self):
         # length parameters for rollout

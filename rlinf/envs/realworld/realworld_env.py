@@ -217,6 +217,8 @@ class RealWorldEnv(gym.Env):
         for value in raw_states.values():
             full_states.append(value)
         full_states = np.concatenate(full_states, axis=-1)
+
+        full_states = full_states.astype(np.float32)
         obs["states"] = full_states
 
         frames = raw_obs["frames"]

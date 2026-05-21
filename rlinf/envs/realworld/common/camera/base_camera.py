@@ -15,6 +15,7 @@
 import queue
 import threading
 import time
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -83,7 +84,14 @@ class BaseCamera(ABC):
     def _capture_frames(self):
         while self._frame_capturing_start:
             time.sleep(1 / self._camera_info.fps)
-            has_frame, frame = self._read_frame()
+            try:
+                has_frame, frame = self._read_frame()
+            except Exception as exc:
+                warnings.warn(
+                    f"Camera {self.name} failed to read frame: {exc}. "
+                    "The camera stream will be restarted by the environment."
+                )
+                has_frame, frame = False, None
             if not has_frame:
                 break
             if not self._frame_queue.empty():
