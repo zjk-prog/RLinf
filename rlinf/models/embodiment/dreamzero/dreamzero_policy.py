@@ -228,6 +228,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         """Convert environment observation to model input for end-effector control"""
         main = env_obs["main_images"]
         wrist = env_obs.get("wrist_images", None)
+        if wrist is None:
+            wrist = env_obs["extra_view_images"][:, 0]
         states = env_obs.get("states", None)
         prompts = env_obs.get("task_descriptions", None)
         if torch.is_tensor(main):
@@ -241,35 +243,63 @@ class DreamZeroPolicy(VLA, BasePolicy):
             else:
                 wrist = np.asarray(wrist)
 
-        def _resize_bt_hwc_uint8(x, h=256, w=256):
-            # x: [B,H,W,C
-            B = x.shape[0]
-            out = np.empty((B, h, w, 3), dtype=np.uint8)
-            for b in range(B):
-                frame = x[b]
-                if frame.dtype != np.uint8:
-                    frame = frame.astype(np.uint8)
-                out[b] = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-            return out
+        expected_state_dim = None
+        try:
+            metadata = getattr(self.config.data_transforms, "metadata", None)
+            if metadata is not None:
+                if isinstance(metadata, dict):
+                    shape = (
+                        metadata.get("modalities", {})
+                        .get("state", {})
+                        .get("state", {})
+                        .get("shape", None)
+                    )
+                    if isinstance(shape, list) and len(shape) > 0:
+                        expected_state_dim = int(shape[-1])
+                else:
+                    modalities = getattr(metadata, "modalities", None)
+                    state_mod = getattr(modalities, "state", None)
+                    state_state = getattr(state_mod, "state", None)
+                    shape = getattr(state_state, "shape", None)
+                    if isinstance(shape, (list, tuple)) and len(shape) > 0:
+                        expected_state_dim = int(shape[-1])
+        except Exception:
+            pass
 
-        main = _resize_bt_hwc_uint8(main)
-        if wrist is not None:
-            wrist = _resize_bt_hwc_uint8(wrist)
         if main.ndim == 4:
             main = main[:, None, ...]
         if wrist is not None and wrist.ndim == 4:
             wrist = wrist[:, None, ...]
-        if states is not None:
-            if torch.is_tensor(states):
-                s_np = states.detach().cpu().numpy()
-            else:
-                s_np = np.asarray(states)
+        if states is None:
+            state_dim = expected_state_dim if expected_state_dim is not None else 8
+            s_np = np.zeros((B, state_dim), dtype=np.float32)
+        elif torch.is_tensor(states):
+            s_np = states.detach().cpu().numpy()
         else:
-            s_np = np.zeros((B, 8), dtype=np.float32)
+            s_np = np.asarray(states)
         if s_np.ndim == 1:
             s_np = s_np[None, :]
-        elif s_np.ndim > 2:
-            s_np = s_np.reshape(B, -1)
+        elif s_np.ndim == 3 and s_np.shape[1] == 1:
+            s_np = s_np[:, 0, :]
+        elif s_np.ndim != 2:
+            raise ValueError(
+                "DreamZero expects states with shape [B,D] (or [B,1,D]), "
+                f"but got shape {s_np.shape}."
+            )
+
+        if s_np.shape[0] != B:
+            raise ValueError(
+                "DreamZero batch size mismatch between images and states: "
+                f"images batch={B}, states batch={s_np.shape[0]}."
+            )
+
+        current_state_dim = s_np.shape[-1]
+        if expected_state_dim is not None and current_state_dim != expected_state_dim:
+            raise ValueError(
+                "DreamZero state dimension mismatch: "
+                f"got {current_state_dim}, expected {expected_state_dim}. "
+                "Refusing to silently truncate/pad state; please ensure metadata and env state are aligned."
+            )
         s_np = s_np.astype(np.float32)
         state_bt = s_np[:, None, :]
         prompts = prompts if prompts is not None else [""] * B
@@ -278,7 +308,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         converted_obs = {
             "video.image": main,  # [B,H,W,C]
             "video.wrist_image": wrist,  # [B,H,W,C]
-            "state.state": state_bt,  # [B,1,8]
+            "state.state": state_bt,  # [B,1,D]
             "annotation.language.action_text": list(prompts),  # list[str], len=B
         }
         return converted_obs
@@ -313,7 +343,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         actions = batch.act["action.actions"]
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
-        actions[..., -1] = np.where(actions[..., -1] > 0, 1.0, -1.0).astype(
+        actions[..., -1] = np.where(actions[..., -1] > 0.5, 1.0, 0.0).astype(
             actions.dtype
         )
 
