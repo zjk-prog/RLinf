@@ -56,6 +56,9 @@ class FrankaRobotConfig:
     # Example: {"230322271990": [0.0, 0.15, 1.0, 0.85]}
     camera_crop_regions: Optional[dict[str, list[float]]] = None
 
+    camera_frame_height: int = 128
+    camera_frame_width: int = 128
+
     is_dummy: bool = False
     use_dense_reward: bool = False
     reward_scale: float = 1.0  # Scale dense reward to make training stable
@@ -601,7 +604,14 @@ class FrankaEnv(gym.Env):
                 "frames": gym.spaces.Dict(
                     {
                         camera_info.name: gym.spaces.Box(
-                            0, 255, shape=(128, 128, 3), dtype=np.uint8
+                            0, 
+                            255, 
+                            shape=(
+                                int(self.config.camera_frame_height),
+                                int(self.config.camera_frame_width),
+                                3,
+                            ), 
+                            dtype=np.uint8
                         )
                         for camera_info in self._camera_infos
                     }
