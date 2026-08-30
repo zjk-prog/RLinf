@@ -21,6 +21,60 @@ from rlinf.algorithms.utils import kl_penalty, safe_normalize
 from rlinf.utils.utils import masked_mean
 
 
+def _conservative_group_value(values: torch.Tensor, penultimate: bool) -> torch.Tensor:
+    """Aggregate signed ensemble advantages without crossing zero."""
+    sorted_values = values.sort(dim=-1).values
+    if penultimate:
+        if values.shape[-1] < 2:
+            raise ValueError("penultimate advantage requires at least two Q heads")
+        positive = sorted_values[..., 1]
+        negative = sorted_values[..., -2]
+    else:
+        positive = sorted_values[..., 0]
+        negative = sorted_values[..., -1]
+    all_positive = sorted_values[..., 0] > 0
+    all_negative = sorted_values[..., -1] < 0
+    return torch.where(
+        all_positive,
+        positive,
+        torch.where(all_negative, negative, torch.zeros_like(positive)),
+    )
+
+
+def compute_group_q_advantages(
+    q_values: torch.Tensor,
+    q_ensemble: Optional[torch.Tensor] = None,
+    strategy: str = "vanilla",
+    normalize_group: bool = True,
+    advantage_min: Optional[float] = None,
+    group_dim: int = 0,
+) -> torch.Tensor:
+    """Compute detached OGPO advantages over candidate actions."""
+    if q_values.shape[group_dim] < 2:
+        raise ValueError("OGPO requires at least two candidate actions per group")
+
+    if strategy == "vanilla":
+        advantages = q_values - q_values.mean(dim=group_dim, keepdim=True)
+        if normalize_group:
+            std = q_values.std(dim=group_dim, keepdim=True, correction=0)
+            advantages = advantages / (std + 1e-8)
+    elif strategy in {"conservative", "penultimate"}:
+        if q_ensemble is None:
+            raise ValueError(f"{strategy} advantage requires per-head Q values")
+        per_head_advantage = q_ensemble - q_ensemble.mean(
+            dim=group_dim, keepdim=True
+        )
+        advantages = _conservative_group_value(
+            per_head_advantage, penultimate=strategy == "penultimate"
+        )
+    else:
+        raise ValueError(f"Unsupported OGPO advantage strategy: {strategy}")
+
+    if advantage_min is not None:
+        advantages = advantages.clamp_min(advantage_min)
+    return advantages.detach()
+
+
 @register_advantage("gae")
 def compute_gae_advantages_and_returns(
     rewards: torch.Tensor,

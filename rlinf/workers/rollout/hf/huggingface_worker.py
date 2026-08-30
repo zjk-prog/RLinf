@@ -117,6 +117,8 @@ class MultiStepRolloutWorker(Worker):
         self.collect_final_values = self.cfg.rollout.get("collect_final_values", True)
         self.version = 0
         self.finished_episodes = None
+        self.ogpo_bon_generator: torch.Generator | None = None
+        self.ogpo_bon_base_seed: int | None = None
 
         self.weight_syncer = None
         self._sync_weight_comm_options = None
@@ -139,6 +141,11 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
     def init_worker(self):
+        if self.cfg.algorithm.loss_type == "embodied_ogpo":
+            self.ogpo_bon_generator = torch.Generator(device=self.device)
+            seed = int(self.cfg.actor.get("seed", 1234))
+            self.ogpo_bon_base_seed = seed + 100_000 + self._rank
+            self._reset_ogpo_bon_generator(0)
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
@@ -148,7 +155,26 @@ class MultiStepRolloutWorker(Worker):
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            allowed_prefixes = tuple(
+                self.cfg.runner.get("ckpt_allowed_missing_prefixes", [])
+            )
+            if allowed_prefixes:
+                incompatible = self.hf_model.load_state_dict(
+                    model_dict, strict=False
+                )
+                invalid_missing = [
+                    key
+                    for key in incompatible.missing_keys
+                    if not key.startswith(allowed_prefixes)
+                ]
+                if invalid_missing or incompatible.unexpected_keys:
+                    raise RuntimeError(
+                        "Checkpoint mismatch: "
+                        f"missing={invalid_missing}, "
+                        f"unexpected={incompatible.unexpected_keys}"
+                    )
+            else:
+                self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(
             self.cfg, "rollout.rlt_feature_model", default=None
@@ -469,8 +495,16 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        ogpo_eval_mode: Literal["ode", "sde_1", "sde"] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if ogpo_eval_mode not in (None, "ode", "sde_1", "sde"):
+            raise ValueError(f"Unsupported OGPO evaluation mode: {ogpo_eval_mode}")
+        if mode == "train" and ogpo_eval_mode is not None:
+            raise ValueError("ogpo_eval_mode is only valid when mode='eval'")
+
         kwargs = (
             self._train_sampling_params
             if mode == "train"
@@ -502,6 +536,34 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.MLP_POLICY,
         ]:
             kwargs["return_obs"] = not hasattr(self.hf_model, "q_head")
+
+        if self.cfg.algorithm.loss_type == "embodied_ogpo":
+            ogpo_cfg = self.cfg.algorithm.ogpo
+            use_sde = mode == "train" or ogpo_eval_mode != "ode"
+            if mode == "train":
+                num_samples = ogpo_cfg.train_best_of_n
+            elif ogpo_eval_mode in ("ode", "sde_1"):
+                num_samples = 1
+            else:
+                num_samples = ogpo_cfg.eval_best_of_n
+            kwargs = {
+                "return_obs": False,
+                "ogpo_use_sde": use_sde,
+                "ogpo_num_samples": int(num_samples),
+                "ogpo_noise_std": float(ogpo_cfg.constant_noise_std),
+                "ogpo_normalize_horizon": bool(ogpo_cfg.get("normalize_denoising_horizon", True)),
+                "ogpo_normalize_dimension": bool(ogpo_cfg.get("normalize_action_dimension", True)),
+                "ogpo_randn_clip_value": float(ogpo_cfg.get("randn_clip_value", 3.0)),
+                "ogpo_clip_randn": bool(ogpo_cfg.get("clip_randn", True)),
+                "ogpo_use_tapered_noise": bool(ogpo_cfg.get("use_tapered_noise", False)),
+                "ogpo_ignore_last": bool(ogpo_cfg.get("ignore_last", True)),
+                "ogpo_error_correct_sde_to_ode": bool(ogpo_cfg.get("error_correct_sde_to_ode", True)),
+                "ogpo_clip_intermediate_actions": bool(ogpo_cfg.get("clip_intermediate_actions", True)),
+                "ogpo_denoised_clip_value": float(ogpo_cfg.get("denoised_clip_value", 1.0)),
+                "ogpo_bon_subsample_heads": ogpo_cfg.get("bon_subsample_heads", 2),
+                "ogpo_bon_fallback_aggregation": ogpo_cfg.get("bon_fallback_aggregation", "min"),
+                "ogpo_bon_generator": self.ogpo_bon_generator,
+            }
 
         only_save_expert = self.algorithm_cfg.get("dagger", {}).get(
             "only_save_expert", True
@@ -561,6 +623,7 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None = None,
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
+        ogpo_eval_mode: Literal["ode", "sde_1", "sde"] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
@@ -575,7 +638,7 @@ class MultiStepRolloutWorker(Worker):
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
             )
-        return self.predict(env_obs, mode=mode)
+        return self.predict(env_obs, mode=mode, ogpo_eval_mode=ogpo_eval_mode)
 
     def _build_policy_output(
         self,
@@ -613,6 +676,8 @@ class MultiStepRolloutWorker(Worker):
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
+        if self.cfg.algorithm.loss_type == "embodied_ogpo":
+            return None
         if final_obs is None:
             return None
         if not (
@@ -665,6 +730,7 @@ class MultiStepRolloutWorker(Worker):
 
         applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
         self.version = applied_version
+        self._reset_ogpo_bon_generator(applied_version)
         if self.finished_episodes is None:
             self.finished_episodes = (
                 self.version * self.total_num_train_envs * self.rollout_epoch
@@ -801,7 +867,12 @@ class MultiStepRolloutWorker(Worker):
             self.offload_model()
 
     @Worker.timer("evaluate")
-    async def evaluate(self, input_channel: Channel, output_channel: Channel):
+    async def evaluate(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        ogpo_eval_mode: Literal["ode", "sde_1", "sde"] | None = None,
+    ):
         if self.enable_offload:
             self.reload_model()
         if self.env_decoupled_mode:
@@ -825,6 +896,7 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    ogpo_eval_mode=ogpo_eval_mode,
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -859,6 +931,7 @@ class MultiStepRolloutWorker(Worker):
                             final_obs=env_output.get("final_obs", None),
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
+                            ogpo_eval_mode=ogpo_eval_mode,
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -1021,3 +1094,8 @@ class MultiStepRolloutWorker(Worker):
     def set_global_step(self, global_step: int):
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+
+    def _reset_ogpo_bon_generator(self, global_step: int) -> None:
+        if self.ogpo_bon_generator is not None and self.ogpo_bon_base_seed is not None:
+            seed = self.ogpo_bon_base_seed + int(global_step) * 1_000_003
+            self.ogpo_bon_generator.manual_seed(seed)

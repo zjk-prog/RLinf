@@ -15,7 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -33,6 +33,7 @@ from rlinf.data.schema.embodied_types import (
     PolicyOutput,
     Trajectory,
     convert_trajectories_to_batch,
+    get_model_weights_id,
 )
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
@@ -85,6 +86,7 @@ class EnvWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
+        self._is_ogpo = self.cfg.algorithm.loss_type == "embodied_ogpo"
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
@@ -160,6 +162,14 @@ class EnvWorker(Worker):
                 self.cfg.env.train.total_num_envs // self._world_size // self.stage_num
             )
             self.train_batch_size = self.cfg.env.train.total_num_envs // self.stage_num
+            if self._is_ogpo:
+                self._ogpo_pending_steps = [
+                    [[] for _ in range(self.train_num_envs_per_stage)]
+                    for _ in range(self.stage_num)
+                ]
+                self._ogpo_completed_episodes: list[list[Trajectory]] = [
+                    [] for _ in range(self.stage_num)
+                ]
         else:
             self.enable_online_lerobot = False
         if self.enable_eval:
@@ -192,6 +202,10 @@ class EnvWorker(Worker):
             ]
         if self.enable_eval:
             self.eval_prev_done: list[torch.Tensor] = [
+                torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
+                for _ in range(self.stage_num)
+            ]
+            self.eval_finished: list[torch.Tensor] = [
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
@@ -509,8 +523,15 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
+        if self._is_ogpo:
+            chunk_step_result = self.env_list[stage_id].chunk_step(
+                chunk_actions,
+                stop_on_done=bool(self.cfg.env.train.get("stop_on_done", False)),
+            )
+        else:
+            chunk_step_result = self.env_list[stage_id].chunk_step(chunk_actions)
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+            chunk_step_result
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -543,6 +564,31 @@ class EnvWorker(Worker):
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
+        if self._is_ogpo:
+            raw_chunk_terminations = infos.pop("_raw_chunk_terminations", None)
+            raw_chunk_truncations = infos.pop("_raw_chunk_truncations", None)
+            if raw_chunk_terminations is None or raw_chunk_truncations is None:
+                raise RuntimeError(
+                    "OGPO requires raw per-step termination data from ManiSkill"
+                )
+            success = torch.zeros(chunk_dones.shape[0], dtype=torch.bool)
+            episode_info = None
+            if isinstance(infos.get("final_info"), dict):
+                episode_info = infos["final_info"].get("episode")
+            if episode_info is None:
+                episode_info = infos.get("episode")
+            if isinstance(episode_info, dict):
+                done_envs = chunk_dones.any(dim=-1).cpu()
+                for key in ("success_once", "success_at_end", "success"):
+                    value = episode_info.get(key)
+                    if value is None:
+                        continue
+                    value = torch.as_tensor(value).bool().reshape(-1).cpu()
+                    if value.numel() == success.numel():
+                        success |= value
+                    elif value.numel() == int(done_envs.sum()):
+                        success[done_envs] |= value
+
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
         )
@@ -574,6 +620,14 @@ class EnvWorker(Worker):
             "truncations": chunk_truncations,
             "infos_list": infos_list,
         }
+        if self._is_ogpo:
+            chunk_step_payload.update(
+                {
+                    "raw_terminations": raw_chunk_terminations,
+                    "raw_truncations": raw_chunk_truncations,
+                    "success": success,
+                }
+            )
         return env_output, env_info, chunk_step_payload
 
     def env_evaluate_step(
@@ -594,8 +648,14 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
+        if self._is_ogpo:
+            chunk_step_result = self.eval_env_list[stage_id].chunk_step(
+                chunk_actions, stop_on_done=True
+            )
+        else:
+            chunk_step_result = self.eval_env_list[stage_id].chunk_step(chunk_actions)
         obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
-            self.eval_env_list[stage_id].chunk_step(chunk_actions)
+            chunk_step_result
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -613,8 +673,17 @@ class EnvWorker(Worker):
         )
 
         current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
-        if self.cfg.env.eval.auto_reset:
+        single_trajectory_per_env = bool(
+            self.cfg.env.eval.get("single_trajectory_per_env", False)
+        )
+        if single_trajectory_per_env:
+            finished = self.eval_finished[stage_id].to(current_dones.device)
+            newly_done = current_dones & ~finished
+            self.eval_finished[stage_id] = finished | current_dones
+            self.eval_prev_done[stage_id] = torch.zeros_like(current_dones)
+        elif self.cfg.env.eval.auto_reset:
             newly_done = current_dones
+            self.eval_prev_done[stage_id] = torch.zeros_like(current_dones)
         else:
             prev = self.eval_prev_done[stage_id].to(current_dones.device)
             newly_done = current_dones & ~prev
@@ -779,7 +848,7 @@ class EnvWorker(Worker):
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
 
-    def finish_rollout(self, mode="train"):
+    def finish_rollout(self, mode="train", video_sub_dir: str | None = None):
         # reset
         if mode == "train":
             for i in range(self.stage_num):
@@ -793,7 +862,7 @@ class EnvWorker(Worker):
                 if self.cfg.env.eval.video_cfg.save_video:
                     flush_video = get_env_attr(self.eval_env_list[i], "flush_video")
                     if callable(flush_video):
-                        flush_video()
+                        flush_video(video_sub_dir=video_sub_dir)
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
@@ -1065,6 +1134,122 @@ class EnvWorker(Worker):
             for env_output in env_output_list
         ]
 
+    def _ogpo_replay_obs(
+        self, obs: dict[str, Any] | None, env_index: int
+    ) -> dict[str, torch.Tensor]:
+        """Convert one state observation to the OGPO replay schema."""
+        if obs is None:
+            return {}
+        return {
+            key: value[env_index].detach().cpu().contiguous().clone()
+            for key, value in obs.items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def _build_ogpo_episode(self, steps: list[dict[str, Any]]) -> Trajectory:
+        """Build one episode of atomic transitions for OGPO replay."""
+        episode_success = any(bool(step["success"]) for step in steps)
+        versions = torch.stack([step["version"] for step in steps]).reshape(
+            len(steps), 1, -1
+        )
+        trajectory = Trajectory(
+            max_episode_length=self.cfg.env.train.max_episode_steps,
+            actions=torch.stack([step["action"] for step in steps])[:, None],
+            rewards=torch.stack([step["reward"] for step in steps])[:, None],
+            terminations=torch.stack(
+                [step["termination"] for step in steps]
+            )[:, None],
+            truncations=torch.stack([step["truncation"] for step in steps])[
+                :, None
+            ],
+            dones=torch.stack([step["done"] for step in steps])[:, None],
+            versions=versions,
+            is_success=torch.full(
+                (len(steps), 1, 1), episode_success, dtype=torch.bool
+            ),
+            curr_obs={
+                key: torch.stack([step["curr_obs"][key] for step in steps])[:, None]
+                for key in steps[0]["curr_obs"]
+            },
+            next_obs={
+                key: torch.stack([step["next_obs"][key] for step in steps])[:, None]
+                for key in steps[0]["next_obs"]
+            },
+        )
+        trajectory.model_weights_id = get_model_weights_id(versions)
+        return trajectory
+
+    def _record_ogpo_transitions(
+        self,
+        stage_id: int,
+        curr_obs: dict[str, Any],
+        env_output: EnvOutput,
+        policy_output: PolicyOutput,
+        *,
+        obs_list: list[dict[str, Any]],
+        raw_terminations: torch.Tensor,
+        raw_truncations: torch.Tensor,
+        success: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        """Split a policy action chunk into episode-scoped atomic transitions."""
+        policy_actions = policy_output.forward_inputs.get("action")
+        if policy_actions is None:
+            raise ValueError("OGPO rollout must return the policy action chunk")
+        chunk_size = int(self.model_cfg.num_action_chunks)
+        action_dim = int(self.model_cfg.action_dim)
+        if policy_actions.ndim != 2 or policy_actions.shape[-1] != chunk_size * action_dim:
+            raise ValueError("OGPO replay received an invalid action dimension")
+        if len(obs_list) != chunk_size:
+            raise ValueError("OGPO replay observation count does not match action chunk")
+        atomic_actions = policy_actions.reshape(-1, chunk_size, action_dim)
+        raw_dones = torch.logical_or(raw_terminations, raw_truncations)
+
+        for env_index in range(self.train_num_envs_per_stage):
+            version = (
+                policy_output.versions[env_index].reshape(-1)[:1]
+                if policy_output.versions is not None
+                else torch.zeros(1, dtype=torch.float32)
+            )
+            pending = self._ogpo_pending_steps[stage_id][env_index]
+            for chunk_index in range(chunk_size):
+                done = bool(raw_dones[env_index, chunk_index])
+                step_curr_obs = curr_obs if chunk_index == 0 else obs_list[chunk_index - 1]
+                step_next_obs = obs_list[chunk_index]
+                if done and env_output.final_obs is not None:
+                    step_next_obs = env_output.final_obs
+                pending.append(
+                    {
+                        "action": atomic_actions[env_index, chunk_index].detach().cpu(),
+                        "reward": env_output.rewards[env_index, chunk_index].detach().cpu(),
+                        "termination": raw_terminations[env_index, chunk_index]
+                        .detach()
+                        .cpu(),
+                        "truncation": raw_truncations[env_index, chunk_index]
+                        .detach()
+                        .cpu(),
+                        "done": raw_dones[env_index, chunk_index].detach().cpu(),
+                        "version": version.detach().cpu(),
+                        "success": bool(success[env_index]),
+                        "curr_obs": self._ogpo_replay_obs(step_curr_obs, env_index),
+                        "next_obs": self._ogpo_replay_obs(step_next_obs, env_index),
+                    }
+                )
+                if done:
+                    self._ogpo_completed_episodes[stage_id].append(
+                        self._build_ogpo_episode(pending)
+                    )
+                    self._ogpo_pending_steps[stage_id][env_index] = []
+                    break
+
+    async def _send_ogpo_episodes(
+        self, episodes: list[Trajectory], channel: Channel
+    ) -> None:
+        for split_index in range(self.actor_split_num):
+            await channel.put(
+                episodes[split_index :: self.actor_split_num], async_op=True
+            ).async_wait()
+
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
         self, trajectory_builder: EmbodiedTrajectoryBuilder, channel: Channel
@@ -1107,6 +1292,8 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
+        if self._is_ogpo:
+            self._ogpo_completed_episodes = [[] for _ in range(self.stage_num)]
         self.trajectory_builders = self._prepare_trajectory_builders(
             getattr(self, "trajectory_builders", None)
         )
@@ -1225,6 +1412,14 @@ class EnvWorker(Worker):
                         policy_output.actions,
                         stage_id,
                     )
+                    if self._is_ogpo:
+                        self._record_ogpo_transitions(
+                            stage_id,
+                            curr_obs,
+                            env_output,
+                            policy_output,
+                            **chunk_step_payload,
+                        )
                     # Emulated observation latency: wait before the obs goes out,
                     # without blocking the other coroutines in this worker.
                     await self._maybe_wait_env_delay(stage_id)
@@ -1258,7 +1453,11 @@ class EnvWorker(Worker):
                         env_metrics["time/interact_delay"].append(
                             self.env_list[stage_id].insert_delay_metrics()
                         )
-                    if self.collect_transitions and not self.enable_rlt:
+                    if (
+                        self.collect_transitions
+                        and not self.enable_rlt
+                        and not self._is_ogpo
+                    ):
                         next_obs = (
                             env_output.final_obs
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
@@ -1376,7 +1575,12 @@ class EnvWorker(Worker):
             self.finish_rollout()
 
         if not self.use_training_pipeline and actor_channel is not None:
-            if self.enable_online_lerobot:
+            if self._is_ogpo:
+                for stage_id in range(self.stage_num):
+                    await self._send_ogpo_episodes(
+                        self._ogpo_completed_episodes[stage_id], actor_channel
+                    )
+            elif self.enable_online_lerobot:
                 for stage_id in range(self.stage_num):
                     episodes = self.trajectory_builders[stage_id].drain_episodes()
                     await self.send_lerobot_episodes(episodes, actor_channel)
@@ -1414,13 +1618,33 @@ class EnvWorker(Worker):
         return env_metrics
 
     @Worker.timer("evaluate")
-    def evaluate(self, input_channel: Channel, rollout_channel: Channel):
+    def evaluate(
+        self,
+        input_channel: Channel,
+        rollout_channel: Channel,
+        ogpo_eval_mode: Literal["ode", "sde_1", "sde"] | None = None,
+    ):
+        if ogpo_eval_mode not in (None, "ode", "sde_1", "sde"):
+            raise ValueError(f"Unsupported OGPO evaluation mode: {ogpo_eval_mode}")
+        if ogpo_eval_mode is not None and not self._is_ogpo:
+            raise ValueError("ogpo_eval_mode requires embodied_ogpo")
+
         eval_metrics = defaultdict(list)
+        single_trajectory_per_env = bool(
+            self.cfg.env.eval.get("single_trajectory_per_env", False)
+        )
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
-            if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
+            if (
+                single_trajectory_per_env
+                or not self.cfg.env.eval.auto_reset
+                or eval_rollout_epoch == 0
+            ):
                 for stage_id in range(self.stage_num):
                     self.eval_env_list[stage_id].is_start = True
                     self.eval_prev_done[stage_id] = torch.zeros(
+                        self.eval_num_envs_per_stage, dtype=torch.bool
+                    )
+                    self.eval_finished[stage_id] = torch.zeros(
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
@@ -1495,7 +1719,7 @@ class EnvWorker(Worker):
                         decoupled_mode=self.env_decoupled_mode,
                     )
 
-            self.finish_rollout(mode="eval")
+            self.finish_rollout(mode="eval", video_sub_dir=ogpo_eval_mode)
         for stage_id in range(self.stage_num):
             if self.eval_enable_offload:
                 get_env_attr(self.eval_env_list[stage_id], "offload")()

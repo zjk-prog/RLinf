@@ -312,6 +312,93 @@ def compute_ppo_actor_loss(
     return policy_loss, metrics_data
 
 
+def compute_flow_matching_bc_loss(
+    predicted_velocity: torch.Tensor,
+    target_velocity: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict]:
+    """Compute flow-matching behavior-cloning loss on valid action steps."""
+    element_loss = (predicted_velocity - target_velocity).square()
+    if valid_mask is not None:
+        while valid_mask.ndim < element_loss.ndim:
+            valid_mask = valid_mask.unsqueeze(-1)
+        valid_mask = valid_mask.expand_as(element_loss).bool()
+    loss = masked_mean(element_loss, valid_mask)
+    return loss, {"actor/bc_loss": loss.detach()}
+
+
+def compute_q_td_loss(
+    q_values: torch.Tensor,
+    target_q: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict]:
+    """Regress every Q head against a scalar TD target on valid rows."""
+    while target_q.ndim < q_values.ndim:
+        target_q = target_q.unsqueeze(-1)
+    target_q = target_q.expand_as(q_values)
+    error = q_values - target_q
+    if loss_type == "mse":
+        element_loss = error.square()
+    elif loss_type == "huber":
+        element_loss = huber_loss(error, huber_delta)
+    else:
+        raise ValueError(f"Unsupported Q loss type: {loss_type}")
+    if valid_mask is not None:
+        while valid_mask.ndim < element_loss.ndim:
+            valid_mask = valid_mask.unsqueeze(-1)
+        valid_mask = valid_mask.expand_as(element_loss).bool()
+    loss = masked_mean(element_loss, valid_mask)
+    return loss, {
+        "critic/td_loss": loss.detach(),
+        "critic/q_mean": masked_mean(q_values.detach(), valid_mask),
+        "critic/target_q_mean": masked_mean(target_q.detach(), valid_mask),
+    }
+
+
+@register_policy_loss("embodied_ogpo")
+def compute_ogpo_policy_loss(
+    *,
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_epsilon: float,
+    entropy: Optional[torch.Tensor] = None,
+    entropy_coeff: float = 0.0,
+    bc_loss: Optional[torch.Tensor] = None,
+    bc_coeff: float = 0.0,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """Combine chain-level PPO, entropy, and success-only BC losses."""
+    ppo_loss, metrics = compute_ppo_actor_loss(
+        logprobs=logprobs.float(),
+        old_logprobs=old_logprobs.float(),
+        advantages=advantages.float(),
+        clip_ratio_low=clip_epsilon,
+        clip_ratio_high=clip_epsilon,
+        loss_mask=loss_mask,
+        **kwargs,
+    )
+    entropy_term = (
+        torch.zeros((), device=ppo_loss.device, dtype=ppo_loss.dtype)
+        if entropy is None
+        else masked_mean(entropy, loss_mask)
+    )
+    if bc_loss is None:
+        bc_loss = torch.zeros((), device=ppo_loss.device, dtype=ppo_loss.dtype)
+    total_loss = ppo_loss - entropy_coeff * entropy_term + bc_coeff * bc_loss
+    metrics.update(
+        {
+            "actor/entropy": entropy_term.detach(),
+            "actor/bc_loss": bc_loss.detach(),
+            "actor/total_loss": total_loss.detach(),
+        }
+    )
+    return total_loss, metrics
+
+
 def compute_ppo_critic_loss(
     values: torch.Tensor,
     returns: torch.Tensor,

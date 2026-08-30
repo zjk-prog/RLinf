@@ -13,7 +13,15 @@
 # limitations under the License.
 
 from rlinf.envs.wrappers.collect_episode import CollectEpisode
-from rlinf.envs.wrappers.insert_delay import InsertDelay
 from rlinf.envs.wrappers.record_video import RecordVideo
 
 __all__ = ["CollectEpisode", "InsertDelay", "RecordVideo"]
+
+
+def __getattr__(name: str):
+    """Load InsertDelay only for callers that actually use delay injection."""
+    if name == "InsertDelay":
+        from rlinf.envs.wrappers.insert_delay import InsertDelay
+
+        return InsertDelay
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

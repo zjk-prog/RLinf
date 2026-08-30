@@ -12,11 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 from torch.distributions.normal import Normal
 
 from .batch_renorm import BatchRenorm
+
+
+def flow_score_from_velocity(
+    velocity: torch.Tensor,
+    actions: torch.Tensor,
+    time: torch.Tensor,
+) -> torch.Tensor:
+    """Recover the CondOT marginal score from a flow velocity field.
+
+    For the conditional optimal-transport path ``alpha_t=t`` and
+    ``beta_t=1-t``, the score is
+    ``grad_x log p_t(x) = (t * v(x, t) - x) / (1 - t)``.
+    Callers using constant noise must not evaluate this expression at ``t=1``.
+    """
+    return (time * velocity - actions) / (1.0 - time)
+
+
+def sde_drift_correction(
+    velocity: torch.Tensor,
+    actions: torch.Tensor,
+    time: torch.Tensor,
+    sigma_base: float | torch.Tensor,
+    use_tapered_noise: bool,
+) -> torch.Tensor:
+    """Compute the score drift that preserves the flow ODE marginals.
+
+    The marginal-preserving SDE adds
+    ``(sigma_t**2 / 2) * grad_x log p_t(x)`` to the learned flow velocity.
+    With tapered noise, ``sigma_t=sigma_base*sqrt(1-t)``, the ``1-t`` term
+    cancels analytically and avoids a division near the endpoint.
+    """
+    sigma = torch.as_tensor(
+        sigma_base,
+        device=velocity.device,
+        dtype=velocity.dtype,
+    )
+    time_velocity_minus_actions = time * velocity - actions
+    if use_tapered_noise:
+        return 0.5 * sigma.square() * time_velocity_minus_actions
+    return 0.5 * sigma.square() * flow_score_from_velocity(
+        velocity,
+        actions,
+        time,
+    )
 
 
 class FlowTActor(nn.Module):
@@ -220,6 +267,413 @@ class FlowTActor(nn.Module):
         total_log_prob -= tanh_correction
 
         return action, total_log_prob.detach()
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Embed a scalar flow timestep with sinusoidal features and a small MLP."""
+
+    def __init__(self, embed_dim: int = 32, max_frequency: float = 10000.0):
+        super().__init__()
+        if embed_dim < 4 or embed_dim % 2 != 0:
+            raise ValueError("embed_dim must be an even integer greater than or equal to 4")
+
+        half_dim = embed_dim // 2
+        frequencies = torch.exp(
+            torch.arange(half_dim, dtype=torch.float32)
+            * -(math.log(max_frequency) / (half_dim - 1))
+        )
+        self.register_buffer("frequencies", frequencies, persistent=False)
+        self.projection = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        """Encode timesteps shaped ``[..., 1]`` or ``[...]``."""
+        if time.ndim > 0 and time.shape[-1] == 1:
+            time = time.squeeze(-1)
+        angles = time.unsqueeze(-1) * self.frequencies.to(dtype=time.dtype)
+        embedding = torch.cat((angles.sin(), angles.cos()), dim=-1)
+        return self.projection(embedding)
+
+
+class OGPOFlowMixin:
+    """Transformer-independent OGPO sampling and flow-matching operations."""
+
+    action_dim: int
+    denoising_steps: int
+    action_scale: torch.Tensor
+    action_bias: torch.Tensor
+
+    def _ogpo_env_actions(self, normalized_actions: torch.Tensor) -> torch.Tensor:
+        """Map bounded normalized actions back to the environment action space."""
+        return normalized_actions.clamp(-1.0, 1.0) * self.action_scale + self.action_bias
+
+    def _ogpo_velocity(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        time: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate the actor-specific deterministic velocity field."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _ogpo_sde_drift(
+        velocity: torch.Tensor,
+        actions: torch.Tensor,
+        time: torch.Tensor,
+        noise_std: float,
+        use_tapered_noise: bool,
+        ignore_last: bool,
+        error_correct_sde_to_ode: bool,
+        is_last_step: bool,
+    ) -> torch.Tensor:
+        """Build the SDE drift shared by sampling and log-prob evaluation."""
+        apply_correction = error_correct_sde_to_ode and (
+            use_tapered_noise or not ignore_last or not is_last_step
+        )
+        if not apply_correction:
+            return velocity
+        return velocity + sde_drift_correction(
+            velocity,
+            actions,
+            time,
+            noise_std,
+            use_tapered_noise,
+        )
+
+    @staticmethod
+    def _ogpo_sde_sigma(
+        actions: torch.Tensor,
+        time: torch.Tensor,
+        noise_std: float,
+        use_tapered_noise: bool,
+        ignore_last: bool,
+        is_last_step: bool,
+    ) -> torch.Tensor:
+        """Build the noise schedule shared by sampling and log-prob evaluation."""
+        if use_tapered_noise:
+            taper = torch.sqrt(torch.clamp(1.0 - time, min=0.0))
+            return torch.ones_like(actions) * noise_std * taper
+        if is_last_step and ignore_last:
+            return torch.zeros_like(actions)
+        return torch.full_like(actions, noise_std)
+
+    def _ogpo_sde_step_statistics(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        time: torch.Tensor,
+        noise_std: float,
+        use_tapered_noise: bool,
+        ignore_last: bool,
+        error_correct_sde_to_ode: bool,
+        is_last_step: bool,
+        clip_intermediate: bool,
+        clip_value: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return velocity, drift, transition mean, and sigma for one SDE step."""
+        velocity = self._ogpo_velocity(obs, actions, time)
+        drift = self._ogpo_sde_drift(
+            velocity,
+            actions,
+            time,
+            noise_std,
+            use_tapered_noise,
+            ignore_last,
+            error_correct_sde_to_ode,
+            is_last_step,
+        )
+        mean_next = actions + drift / self.denoising_steps
+        if clip_intermediate:
+            mean_next = mean_next.clamp(-clip_value, clip_value)
+        sigma = self._ogpo_sde_sigma(
+            actions,
+            time,
+            noise_std,
+            use_tapered_noise,
+            ignore_last,
+            is_last_step,
+        )
+        return velocity, drift, mean_next, sigma
+
+    @staticmethod
+    def _normalize_ogpo_statistic(
+        value: torch.Tensor,
+        contributing_steps: int,
+        action_dim: int,
+        normalize_horizon: bool,
+        normalize_dimension: bool,
+    ) -> torch.Tensor:
+        if normalize_horizon:
+            value = value / max(contributing_steps, 1)
+        if normalize_dimension:
+            value = value / action_dim
+        return value
+
+    def sample_ogpo_sde(
+        self,
+        obs: torch.Tensor,
+        num_samples: int,
+        noise_std: float,
+        normalize_horizon: bool = True,
+        normalize_dimension: bool = True,
+        randn_clip_value: float = 3.0,
+        clip_randn: bool = True,
+        use_tapered_noise: bool = False,
+        ignore_last: bool = True,
+        error_correct_sde_to_ode: bool = True,
+        clip_intermediate: bool = True,
+        clip_value: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample marginal-preserving SDE chains without changing parameters."""
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        if noise_std <= 0:
+            raise ValueError("noise_std must be positive")
+        if clip_value <= 0:
+            raise ValueError("clip_value must be positive")
+
+        batch_size = obs.shape[0]
+        expanded_obs = (
+            obs.unsqueeze(0)
+            .expand(num_samples, *obs.shape)
+            .reshape(num_samples * batch_size, -1)
+        )
+        actions = torch.randn(
+            num_samples * batch_size,
+            self.action_dim,
+            device=obs.device,
+            dtype=obs.dtype,
+        )
+        chains = [actions]
+        initial = Normal(torch.zeros_like(actions), torch.ones_like(actions))
+        log_prob = initial.log_prob(actions).sum(dim=-1)
+        for step in range(self.denoising_steps):
+            is_last_step = step == self.denoising_steps - 1
+            time = torch.full(
+                (actions.shape[0], 1),
+                step / self.denoising_steps,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            _, _, mean_next, sigma = self._ogpo_sde_step_statistics(
+                expanded_obs,
+                actions,
+                time,
+                noise_std,
+                use_tapered_noise,
+                ignore_last,
+                error_correct_sde_to_ode,
+                is_last_step,
+                clip_intermediate,
+                clip_value,
+            )
+            deterministic_last_step = (
+                is_last_step and ignore_last and not use_tapered_noise
+            )
+            if deterministic_last_step:
+                actions = mean_next
+            else:
+                noise = torch.randn_like(actions)
+                if clip_randn:
+                    noise = noise.clamp(-randn_clip_value, randn_clip_value)
+                actions = mean_next + sigma * noise
+                if is_last_step:
+                    actions = actions.clamp(-1.0, 1.0)
+                log_prob = log_prob + Normal(mean_next, sigma).log_prob(actions).sum(
+                    dim=-1
+                )
+            if deterministic_last_step:
+                actions = actions.clamp(-1.0, 1.0)
+            chains.append(actions)
+
+        contributing_steps = self.denoising_steps + int(
+            use_tapered_noise or not ignore_last
+        )
+        log_prob = self._normalize_ogpo_statistic(
+            log_prob,
+            contributing_steps,
+            self.action_dim,
+            normalize_horizon,
+            normalize_dimension,
+        )
+        env_actions = self._ogpo_env_actions(actions)
+        return (
+            env_actions.reshape(num_samples, batch_size, self.action_dim),
+            torch.stack(chains, dim=1).reshape(
+                num_samples,
+                batch_size,
+                self.denoising_steps + 1,
+                self.action_dim,
+            ),
+            log_prob.reshape(num_samples, batch_size),
+        )
+
+    def sample_ogpo_ode(
+        self,
+        obs: torch.Tensor,
+        num_samples: int = 1,
+        clip_intermediate: bool = True,
+        clip_value: float = 1.0,
+    ) -> torch.Tensor:
+        """Sample actions with deterministic Euler integration after initialization."""
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        if clip_value <= 0:
+            raise ValueError("clip_value must be positive")
+
+        batch_size = obs.shape[0]
+        expanded_obs = (
+            obs.unsqueeze(0)
+            .expand(num_samples, *obs.shape)
+            .reshape(num_samples * batch_size, -1)
+        )
+        actions = torch.randn(
+            num_samples * batch_size,
+            self.action_dim,
+            device=obs.device,
+            dtype=obs.dtype,
+        )
+        dt = 1.0 / self.denoising_steps
+
+        for step in range(self.denoising_steps):
+            time = torch.full(
+                (actions.shape[0], 1),
+                step / self.denoising_steps,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            actions = actions + self._ogpo_velocity(
+                expanded_obs, actions, time
+            ) * dt
+            if clip_intermediate:
+                actions = actions.clamp(-clip_value, clip_value)
+
+        env_actions = self._ogpo_env_actions(actions)
+        return env_actions.reshape(num_samples, batch_size, self.action_dim)
+
+    def ogpo_log_prob(
+        self,
+        obs: torch.Tensor,
+        chains: torch.Tensor,
+        noise_std: float,
+        normalize_horizon: bool = True,
+        normalize_dimension: bool = True,
+        use_tapered_noise: bool = False,
+        ignore_last: bool = True,
+        error_correct_sde_to_ode: bool = True,
+        clip_intermediate: bool = True,
+        clip_value: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Recompute current-policy probability on fixed target-policy chains."""
+        if noise_std <= 0:
+            raise ValueError("noise_std must be positive")
+        if clip_value <= 0:
+            raise ValueError("clip_value must be positive")
+        if chains.ndim != 4:
+            raise ValueError("chains must have shape [N, B, S + 1, A]")
+        num_samples, batch_size, chain_length, action_dim = chains.shape
+        if chain_length != self.denoising_steps + 1 or action_dim != self.action_dim:
+            raise ValueError("chain shape does not match the flow actor")
+
+        expanded_obs = (
+            obs.unsqueeze(0)
+            .expand(num_samples, *obs.shape)
+            .reshape(num_samples * batch_size, -1)
+        )
+        flat_chains = chains.reshape(
+            num_samples * batch_size, chain_length, action_dim
+        )
+        initial = flat_chains[:, 0]
+        initial_dist = Normal(torch.zeros_like(initial), torch.ones_like(initial))
+        log_prob = initial_dist.log_prob(initial).sum(dim=-1)
+        entropy = initial_dist.entropy().sum(dim=-1)
+        velocity_means = []
+        drift_means = []
+        sigma_means = []
+
+        for step in range(self.denoising_steps):
+            is_last_step = step == self.denoising_steps - 1
+            actions = flat_chains[:, step]
+            time = torch.full(
+                (actions.shape[0], 1),
+                step / self.denoising_steps,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            velocity, drift, mean_next, sigma = self._ogpo_sde_step_statistics(
+                expanded_obs,
+                actions,
+                time,
+                noise_std,
+                use_tapered_noise,
+                ignore_last,
+                error_correct_sde_to_ode,
+                is_last_step,
+                clip_intermediate,
+                clip_value,
+            )
+            velocity_means.append(velocity.mean())
+            drift_means.append(drift.mean())
+            sigma_means.append(sigma.mean())
+            deterministic_last_step = (
+                is_last_step and ignore_last and not use_tapered_noise
+            )
+            if deterministic_last_step:
+                continue
+            transition = Normal(mean_next, sigma)
+            log_prob = log_prob + transition.log_prob(
+                flat_chains[:, step + 1]
+            ).sum(dim=-1)
+            entropy = entropy + transition.entropy().sum(dim=-1)
+
+        contributing_steps = self.denoising_steps + int(
+            use_tapered_noise or not ignore_last
+        )
+        log_prob = self._normalize_ogpo_statistic(
+            log_prob,
+            contributing_steps,
+            self.action_dim,
+            normalize_horizon,
+            normalize_dimension,
+        )
+        entropy = self._normalize_ogpo_statistic(
+            entropy,
+            contributing_steps,
+            self.action_dim,
+            normalize_horizon,
+            normalize_dimension,
+        )
+        shape = (num_samples, batch_size)
+        return log_prob.reshape(shape), entropy.reshape(shape), {
+            "velocity_mean": torch.stack(velocity_means).mean().detach(),
+            "drift_mean": torch.stack(drift_means).mean().detach(),
+            "sigma_mean": torch.stack(sigma_means).mean().detach(),
+        }
+
+    def ogpo_flow_matching(
+        self,
+        obs: torch.Tensor,
+        env_actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the bounded-action flow target used by the public OGPO actor."""
+        target_actions = (
+            env_actions - self.action_bias
+        ) / self.action_scale.clamp_min(1e-6)
+        target_actions = target_actions.clamp(-1.0, 1.0)
+        noise = torch.randn_like(target_actions)
+        time = torch.rand(
+            target_actions.shape[0],
+            1,
+            device=target_actions.device,
+            dtype=target_actions.dtype,
+        )
+        interpolated = (1.0 - time) * noise + time * target_actions
+        target_velocity = target_actions - noise
+        return self._ogpo_velocity(obs, interpolated, time), target_velocity
 
 
 class JaxFlowTActor(nn.Module):
@@ -467,3 +921,121 @@ class JaxFlowTActor(nn.Module):
         total_log_prob -= tanh_correction
 
         return action, total_log_prob
+
+
+class OGPOFlowActor(OGPOFlowMixin, nn.Module):
+    """OGPO-style MLP velocity field over observation, action, and time."""
+
+    _ACTIVATIONS = {
+        "gelu": nn.GELU,
+        "relu": nn.ReLU,
+        "silu": nn.SiLU,
+        "tanh": nn.Tanh,
+    }
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dims: Sequence[int] = (256, 256, 256),
+        activation: str = "gelu",
+        layer_norm: bool = False,
+        time_embedding_type: str = "sinusoidal",
+        time_embedding_dim: int = 32,
+        denoising_steps: int = 4,
+        use_batch_norm: bool = False,
+        batch_norm_momentum: float = 0.99,
+        action_scale: torch.Tensor | None = None,
+        action_bias: torch.Tensor | None = None,
+        noise_std_train: float = 0.3,
+        noise_std_rollout: float = 0.02,
+    ):
+        super().__init__()
+        if not hidden_dims or any(dim <= 0 for dim in hidden_dims):
+            raise ValueError("hidden_dims must contain positive integers")
+        if denoising_steps < 1:
+            raise ValueError("denoising_steps must be positive")
+
+        activation = activation.lower()
+        if activation not in self._ACTIVATIONS:
+            supported = ", ".join(sorted(self._ACTIVATIONS))
+            raise ValueError(f"Unsupported activation {activation!r}; choose {supported}")
+
+        time_embedding_type = time_embedding_type.lower()
+        if time_embedding_type == "scalar":
+            self.time_embedding = nn.Identity()
+            time_feature_dim = 1
+        elif time_embedding_type == "sinusoidal":
+            self.time_embedding = SinusoidalTimeEmbedding(time_embedding_dim)
+            time_feature_dim = time_embedding_dim
+        else:
+            raise ValueError(
+                "time_embedding_type must be either 'scalar' or 'sinusoidal'"
+            )
+
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.denoising_steps = denoising_steps
+        self.use_batch_norm = use_batch_norm
+        self.noise_std_train = noise_std_train
+        self.noise_std_rollout = noise_std_rollout
+
+        if self.use_batch_norm:
+            self.bn_obs = BatchRenorm(self.obs_dim, momentum=batch_norm_momentum)
+            self.bn_action = BatchRenorm(self.action_dim, momentum=batch_norm_momentum)
+
+        input_dim = obs_dim + action_dim + time_feature_dim
+        layers = []
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(self._ACTIVATIONS[activation]())
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, action_dim))
+        self.velocity_net = nn.Sequential(*layers)
+
+        if action_scale is not None and action_bias is not None:
+            self.register_buffer("action_scale", action_scale)
+            self.register_buffer("action_bias", action_bias)
+        else:
+            self.register_buffer("action_scale", torch.ones(action_dim))
+            self.register_buffer("action_bias", torch.zeros(action_dim))
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def _ogpo_velocity(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        time: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_batch_norm:
+            obs = self.bn_obs(obs, self.training)
+            actions = self.bn_action(actions, self.training)
+        time_features = self.time_embedding(time)
+        inputs = torch.cat((obs, actions, time_features), dim=-1)
+        return self.velocity_net(inputs)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        train: bool = False,
+        log_grad: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample one action while preserving the existing flow-actor interface."""
+        noise_std = self.noise_std_train if train else self.noise_std_rollout
+        actions, _, log_probs = self.sample_ogpo_sde(
+            obs,
+            num_samples=1,
+            noise_std=noise_std,
+            normalize_horizon=False,
+            normalize_dimension=False,
+        )
+        return actions[0], log_probs[0].unsqueeze(-1)

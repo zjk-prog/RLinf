@@ -1,0 +1,72 @@
+defaults:
+  - maniskill_ogpo_flow_state
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+runner:
+  # BC creates this checkpoint, so it must not inherit the online trainer's
+  # OGPO_BC_CKPT requirement.
+  ckpt_path: null
+  logger:
+    experiment_name: "maniskill_ogpo_bc"
+
+rollout:
+  model:
+    model_path: ""
+
+actor:
+  model:
+    num_action_chunks: 4
+    add_q_head: False
+
+env:
+  eval:
+    total_num_envs: 16
+    auto_reset: False
+    ignore_terminations: True
+    use_fixed_reset_state_ids: True
+    max_episode_steps: 100
+    video_cfg:
+      save_video: False
+      info_on_video: True
+      extra_info_on_video:
+        - episode.success_once
+        - episode.episode_len
+
+bc:
+  # Generate this file with the commands documented in run_ogpo_bc.sh.
+  dataset_path: /path/to/maniskill_assets/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5
+  output_path: ${runner.logger.log_path}/ogpo_bc.pt
+  expected_env_id: "PickCube-v1"
+  expected_control_mode: "pd_ee_delta_pos"
+  success_only: True
+
+  device: "cuda"
+  seed: 1234
+  num_workers: 0
+  batch_size: 1024
+  lr: 1.0e-4
+  weight_decay: 0.0
+  clip_grad_norm: 10.0
+  max_updates: 500000
+  log_interval: 100
+
+  # Evaluation compares one SDE chunk and one ODE chunk on fixed reset states.
+  # Neither path reads q_head or performs best-of-N selection.
+  eval_interval: 5000
+  eval_episodes: 96
+  eval_num_envs: 16
+  eval_seed: 0
+  eval_max_episode_steps: 100
+  eval_sim_backend: "gpu"
+  # Record separate fixed-seed 2x2 SDE and ODE rollouts without affecting metrics.
+  eval_save_video: True
+  eval_video_interval: ${bc.eval_interval}
+  eval_video_num_envs: 4
+  # Videos are separated into ${bc.eval_video_dir}/{sde,ode}.
+  eval_video_dir: ${runner.logger.log_path}/video/bc_eval
+  success_threshold: 0.4
+  save_last: False

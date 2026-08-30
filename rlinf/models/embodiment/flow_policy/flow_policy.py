@@ -19,8 +19,13 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
+from rlinf.algorithms.utils import aggregate_bon_q_values, select_best_of_n
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
-from rlinf.models.embodiment.modules.flow_actor import FlowTActor, JaxFlowTActor
+from rlinf.models.embodiment.modules.flow_actor import (
+    FlowTActor,
+    JaxFlowTActor,
+    OGPOFlowActor,
+)
 from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.models.embodiment.modules.resnet_utils import ResNetEncoder
 from rlinf.models.embodiment.modules.utils import init_mlp_weights, layer_init, make_mlp
@@ -402,6 +407,10 @@ class FlowStateConfig:
     add_q_head: bool = False
     q_head_type: str = "default"
     num_q_heads: int = 2
+    q_hidden_dims: list[int] = field(default_factory=lambda: [256, 256, 256])
+    q_activation: str = "tanh"
+    q_layer_norm: bool = True
+    q_initializer: str = "legacy"
 
     action_scale = None
     final_tanh = True
@@ -413,7 +422,14 @@ class FlowStateConfig:
     n_layers: int = 2
     use_batch_norm: bool = False
     batch_norm_momentum: float = 0.99
-    flow_actor_type: str = "JaxFlowTActor"  # "FlowTActor" or "JaxFlowTActor"
+    flow_actor_type: str = "JaxFlowTActor"  # Also supports OGPOFlowActor.
+    flow_mlp_hidden_dims: list[int] = field(
+        default_factory=lambda: [256, 256, 256]
+    )
+    flow_mlp_activation: str = "gelu"
+    flow_mlp_layer_norm: bool = False
+    time_embedding_type: str = "sinusoidal"
+    time_embedding_dim: int = 32
     # Whether to use a separate head to predict noise_std
     noise_std_head: bool = False
     # Min/Max log std for training (if using noise_std_head)
@@ -444,6 +460,8 @@ class FlowStatePolicy(nn.Module, BasePolicy):
     def __init__(self, cfg: FlowStateConfig):
         super().__init__()
         self.cfg = cfg
+        if self.cfg.num_action_chunks <= 0:
+            raise ValueError("num_action_chunks must be positive")
 
         # 3 layer MLP encoder for obs
         self.backbone = nn.Sequential(
@@ -454,25 +472,28 @@ class FlowStatePolicy(nn.Module, BasePolicy):
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
         )
-        # Create flow actor
-        # FlowTActor will receive mix_feature (256 dim) as obs input
-        # So we set obs_dim to 256 (output of mix_proj)
+        # The flow actor receives the 256-dimensional state-backbone feature.
         flow_obs_dim = 256
+        flow_action_dim = self.cfg.action_dim * self.cfg.num_action_chunks
 
         # Action scaling for flow actor
         if self.cfg.action_scale is not None:
             l, h = self.cfg.action_scale
-            action_scale = torch.tensor((h - l) / 2.0, dtype=torch.float32)
-            action_bias = torch.tensor((h + l) / 2.0, dtype=torch.float32)
+            action_scale = torch.full(
+                (flow_action_dim,), (h - l) / 2.0, dtype=torch.float32
+            )
+            action_bias = torch.full(
+                (flow_action_dim,), (h + l) / 2.0, dtype=torch.float32
+            )
         else:
             # Default to [-1, 1] range
-            action_scale = torch.ones(self.cfg.action_dim, dtype=torch.float32)
-            action_bias = torch.zeros(self.cfg.action_dim, dtype=torch.float32)
+            action_scale = torch.ones(flow_action_dim, dtype=torch.float32)
+            action_bias = torch.zeros(flow_action_dim, dtype=torch.float32)
 
         if self.cfg.flow_actor_type == "FlowTActor":
             self.flow_actor = FlowTActor(
                 obs_dim=flow_obs_dim,
-                action_dim=self.cfg.action_dim,
+                action_dim=flow_action_dim,
                 d_model=self.cfg.d_model,
                 n_head=self.cfg.n_head,
                 n_layers=self.cfg.n_layers,
@@ -485,7 +506,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         elif self.cfg.flow_actor_type == "JaxFlowTActor":
             self.flow_actor = JaxFlowTActor(
                 obs_dim=flow_obs_dim,
-                action_dim=self.cfg.action_dim,
+                action_dim=flow_action_dim,
                 d_model=self.cfg.d_model,
                 n_head=self.cfg.n_head,
                 n_layers=self.cfg.n_layers,
@@ -502,6 +523,23 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 noise_std_train=self.cfg.noise_std_train,
                 noise_std_rollout=self.cfg.noise_std_rollout,
             )
+        elif self.cfg.flow_actor_type == "OGPOFlowActor":
+            self.flow_actor = OGPOFlowActor(
+                obs_dim=flow_obs_dim,
+                action_dim=flow_action_dim,
+                hidden_dims=self.cfg.flow_mlp_hidden_dims,
+                activation=self.cfg.flow_mlp_activation,
+                layer_norm=self.cfg.flow_mlp_layer_norm,
+                time_embedding_type=self.cfg.time_embedding_type,
+                time_embedding_dim=self.cfg.time_embedding_dim,
+                denoising_steps=self.cfg.denoising_steps,
+                use_batch_norm=self.cfg.use_batch_norm,
+                batch_norm_momentum=self.cfg.batch_norm_momentum,
+                action_scale=action_scale,
+                action_bias=action_bias,
+                noise_std_train=self.cfg.noise_std_train,
+                noise_std_rollout=self.cfg.noise_std_rollout,
+            )
         else:
             raise ValueError(f"Unknown flow_actor_type: {self.cfg.flow_actor_type}")
 
@@ -514,26 +552,25 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         if self.cfg.add_q_head:
             self.q_head = MultiQHead(
                 hidden_size=self.cfg.obs_dim,
-                hidden_dims=[256, 256, 256],
+                hidden_dims=self.cfg.q_hidden_dims,
                 num_q_heads=self.cfg.num_q_heads,
-                action_feature_dim=self.cfg.action_dim,
+                action_feature_dim=flow_action_dim,
+                activation=self.cfg.q_activation,
+                use_layer_norm=self.cfg.q_layer_norm,
+                initializer=self.cfg.q_initializer,
             )
 
-        if self.cfg.action_scale is not None:
-            l, h = self.cfg.action_scale
-            self.register_buffer(
-                "action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32)
-            )
-        else:
-            self.action_scale = None
+        self.register_buffer("action_scale", action_scale.clone())
+        self.register_buffer("action_bias", action_bias.clone())
 
     # added num_action_chunks property
     @property
     def num_action_chunks(self):
         return self.cfg.num_action_chunks
+
+    @property
+    def flow_action_dim(self):
+        return self.cfg.num_action_chunks * self.cfg.action_dim
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -543,8 +580,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         """SAC forward pass using Flow Matching actor"""
         feat = self.backbone(obs["states"])
 
-        # Use flow actor to generate actions
-        # FlowTActor expects obs as input, we pass mix_feature as the observation
+        # Use the selected flow actor to generate actions from state features.
         action, log_prob = self.flow_actor(feat, train=True, log_grad=False)
 
         return action, log_prob, None
@@ -556,6 +592,113 @@ class FlowStatePolicy(nn.Module, BasePolicy):
     # use get_q_values() as sac_q_forward()
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
         return self.q_head(obs["states"], actions)
+
+    def ogpo_sample_forward(
+        self,
+        obs,
+        num_samples: int,
+        noise_std: float,
+        normalize_horizon: bool = True,
+        normalize_dimension: bool = True,
+        randn_clip_value: float = 3.0,
+        clip_randn: bool = True,
+        use_tapered_noise: bool = False,
+        ignore_last: bool = True,
+        error_correct_sde_to_ode: bool = True,
+        clip_intermediate: bool = True,
+        clip_value: float = 1.0,
+        **kwargs,
+    ):
+        """Sample OGPO chains with the existing state encoder and flow actor."""
+        features = self.backbone(obs["states"])
+        return self.flow_actor.sample_ogpo_sde(
+            features,
+            num_samples=num_samples,
+            noise_std=noise_std,
+            normalize_horizon=normalize_horizon,
+            normalize_dimension=normalize_dimension,
+            randn_clip_value=randn_clip_value,
+            clip_randn=clip_randn,
+            use_tapered_noise=use_tapered_noise,
+            ignore_last=ignore_last,
+            error_correct_sde_to_ode=error_correct_sde_to_ode,
+            clip_intermediate=clip_intermediate,
+            clip_value=clip_value,
+        )
+
+    def ogpo_ode_forward(
+        self,
+        obs,
+        num_samples: int = 1,
+        clip_intermediate: bool = True,
+        clip_value: float = 1.0,
+    ):
+        """Sample actions from the BC flow with deterministic ODE integration."""
+        features = self.backbone(obs["states"])
+        return self.flow_actor.sample_ogpo_ode(
+            features,
+            num_samples=num_samples,
+            clip_intermediate=clip_intermediate,
+            clip_value=clip_value,
+        )
+
+    def ogpo_log_prob_forward(
+        self,
+        obs,
+        chains,
+        noise_std: float,
+        normalize_horizon: bool = True,
+        normalize_dimension: bool = True,
+        use_tapered_noise: bool = False,
+        ignore_last: bool = True,
+        error_correct_sde_to_ode: bool = True,
+        clip_intermediate: bool = True,
+        clip_value: float = 1.0,
+        **kwargs,
+    ):
+        """Evaluate fixed target-policy chains with the online actor."""
+        features = self.backbone(obs["states"])
+        return self.flow_actor.ogpo_log_prob(
+            features,
+            chains,
+            noise_std=noise_std,
+            normalize_horizon=normalize_horizon,
+            normalize_dimension=normalize_dimension,
+            use_tapered_noise=use_tapered_noise,
+            ignore_last=ignore_last,
+            error_correct_sde_to_ode=error_correct_sde_to_ode,
+            clip_intermediate=clip_intermediate,
+            clip_value=clip_value,
+        )
+
+    def ogpo_bc_forward(self, obs, actions, **kwargs):
+        """Construct flattened action-chunk flow-matching targets for BC."""
+        expected_shape = (
+            obs["states"].shape[0],
+            self.cfg.num_action_chunks,
+            self.cfg.action_dim,
+        )
+        if tuple(actions.shape) != expected_shape:
+            raise ValueError(
+                f"BC actions have shape {tuple(actions.shape)}; expected "
+                f"{expected_shape}."
+            )
+        features = self.backbone(obs["states"])
+        return self.flow_actor.ogpo_flow_matching(
+            features, actions.reshape(actions.shape[0], -1)
+        )
+
+    def _ogpo_candidate_q(self, obs, candidates):
+        num_samples, batch_size = candidates.shape[:2]
+        states = (
+            obs["states"]
+            .unsqueeze(0)
+            .expand(num_samples, *obs["states"].shape)
+            .reshape(num_samples * batch_size, -1)
+        )
+        return self.q_head(
+            states, candidates.reshape(num_samples * batch_size, self.flow_action_dim)
+        ).reshape(num_samples, batch_size, -1)
 
     # 10. add unified forward()
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
@@ -572,6 +715,12 @@ class FlowStatePolicy(nn.Module, BasePolicy):
             return self.sac_forward(**kwargs)  # originally exists
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)  # use get_q_values()
+        elif forward_type == ForwardType.OGPO_SAMPLE:
+            return self.ogpo_sample_forward(**kwargs)
+        elif forward_type == ForwardType.OGPO_LOG_PROB:
+            return self.ogpo_log_prob_forward(**kwargs)
+        elif forward_type == ForwardType.OGPO_BC:
+            return self.ogpo_bc_forward(**kwargs)
         elif forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)  # NOT USED (NO get_feature)
         else:
@@ -607,10 +756,65 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         """
         env_obs = self.preprocess_env_obs(env_obs)
 
-        feat = self.backbone(env_obs["states"])  # encode obs using the 3 layer MLP
-
-        # Use flow actor
-        action, log_prob = self.flow_actor(feat, train=False, log_grad=False)
+        if kwargs.get("ogpo_use_sde", False):
+            candidates, _, candidate_logprobs = self.ogpo_sample_forward(
+                env_obs,
+                num_samples=int(kwargs.get("ogpo_num_samples", 1)),
+                noise_std=float(kwargs["ogpo_noise_std"]),
+                normalize_horizon=bool(
+                    kwargs.get("ogpo_normalize_horizon", True)
+                ),
+                normalize_dimension=bool(
+                    kwargs.get("ogpo_normalize_dimension", True)
+                ),
+                randn_clip_value=float(kwargs.get("ogpo_randn_clip_value", 3.0)),
+                clip_randn=bool(kwargs.get("ogpo_clip_randn", True)),
+                use_tapered_noise=bool(
+                    kwargs.get("ogpo_use_tapered_noise", False)
+                ),
+                ignore_last=bool(kwargs.get("ogpo_ignore_last", True)),
+                error_correct_sde_to_ode=bool(
+                    kwargs.get("ogpo_error_correct_sde_to_ode", True)
+                ),
+                clip_intermediate=bool(
+                    kwargs.get("ogpo_clip_intermediate_actions", True)
+                ),
+                clip_value=float(kwargs.get("ogpo_denoised_clip_value", 1.0)),
+            )
+            if candidates.shape[0] == 1:
+                action = candidates[0]
+                log_prob = candidate_logprobs[0].unsqueeze(-1)
+            else:
+                q_ensemble = self._ogpo_candidate_q(env_obs, candidates)
+                q_values = aggregate_bon_q_values(
+                    q_ensemble,
+                    subsample_size=kwargs.get("ogpo_bon_subsample_heads", 2),
+                    ensemble_dim=-1,
+                    generator=kwargs.get("ogpo_bon_generator"),
+                    fallback_method=kwargs.get(
+                        "ogpo_bon_fallback_aggregation", "min"
+                    ),
+                )
+                action, _, best_indices = select_best_of_n(candidates, q_values)
+                batch_indices = torch.arange(action.shape[0], device=action.device)
+                log_prob = candidate_logprobs[
+                    best_indices, batch_indices
+                ].unsqueeze(-1)
+        elif "ogpo_use_sde" in kwargs:
+            action = self.ogpo_ode_forward(
+                env_obs,
+                num_samples=1,
+                clip_intermediate=bool(
+                    kwargs.get("ogpo_clip_intermediate_actions", True)
+                ),
+                clip_value=float(kwargs.get("ogpo_denoised_clip_value", 1.0)),
+            )[0]
+            log_prob = torch.zeros(
+                (action.shape[0], 1), device=action.device, dtype=action.dtype
+            )
+        else:
+            feat = self.backbone(env_obs["states"])
+            action, log_prob = self.flow_actor(feat, train=False, log_grad=False)
 
         # chunk_actions is always torch tensor
         chunk_actions = action.reshape(

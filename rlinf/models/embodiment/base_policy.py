@@ -27,6 +27,9 @@ class ForwardType(Enum):
     IQL_CRITIC = "iql_critic"
     IQL_VALUE = "iql_value"
     NFT = "nft"
+    OGPO_SAMPLE = "ogpo_sample"
+    OGPO_LOG_PROB = "ogpo_log_prob"
+    OGPO_BC = "ogpo_bc"
 
 
 class BasePolicy(ABC):
@@ -67,6 +70,15 @@ class BasePolicy(ABC):
         raise NotImplementedError
 
     def iql_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def ogpo_sample_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def ogpo_log_prob_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def ogpo_bc_forward(self, **kwargs):
         raise NotImplementedError
 
     def prepare_dagger_sft_batch(self, batch):

@@ -34,6 +34,12 @@ from rlinf.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
 
+
+def get_embodied_eval_modes(cfg: DictConfig) -> tuple[str | None, ...]:
+    if cfg.algorithm.loss_type == "embodied_ogpo":
+        return ("ode", "sde_1", "sde")
+    return (None,)
+
 if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
@@ -192,18 +198,28 @@ class EmbodiedRunner:
         rollout_handle.wait()
 
     def evaluate(self):
-        env_handle: Handle = self.env.evaluate(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
-        )
-        rollout_handle: Handle = self.rollout.evaluate(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
-        )
-        env_results = env_handle.wait()
-        rollout_handle.wait()
-        eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        eval_metrics = {}
+        for eval_mode in get_embodied_eval_modes(self.cfg):
+            env_handle: Handle = self.env.evaluate(
+                input_channel=self.env_channel,
+                rollout_channel=self.rollout_channel,
+                ogpo_eval_mode=eval_mode,
+            )
+            rollout_handle: Handle = self.rollout.evaluate(
+                input_channel=self.rollout_channel,
+                output_channel=self.env_channel,
+                ogpo_eval_mode=eval_mode,
+            )
+            env_results = env_handle.wait()
+            rollout_handle.wait()
+            mode_metrics = compute_evaluate_metrics(
+                [results for results in env_results if results is not None]
+            )
+            if eval_mode is None:
+                return mode_metrics
+            eval_metrics.update(
+                {f"{eval_mode}/{key}": value for key, value in mode_metrics.items()}
+            )
         return eval_metrics
 
     def _log_ranked_metrics(

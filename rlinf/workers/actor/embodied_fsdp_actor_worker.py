@@ -121,7 +121,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
-            model.load_state_dict(model_dict)
+            allowed_prefixes = tuple(
+                self.cfg.runner.get("ckpt_allowed_missing_prefixes", [])
+            )
+            if allowed_prefixes:
+                incompatible = model.load_state_dict(model_dict, strict=False)
+                invalid_missing = [
+                    key
+                    for key in incompatible.missing_keys
+                    if not key.startswith(allowed_prefixes)
+                ]
+                if invalid_missing or incompatible.unexpected_keys:
+                    raise RuntimeError(
+                        "Checkpoint mismatch: "
+                        f"missing={invalid_missing}, "
+                        f"unexpected={incompatible.unexpected_keys}"
+                    )
+            else:
+                model.load_state_dict(model_dict)
 
         return model
 

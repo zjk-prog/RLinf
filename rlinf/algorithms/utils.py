@@ -17,6 +17,95 @@ from typing import Optional
 import torch
 
 
+def aggregate_q_values(
+    q_values: torch.Tensor,
+    method: str = "mean",
+    ensemble_dim: int = -1,
+    subsample_size: int = 2,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Aggregate an ensemble of Q estimates."""
+    if method == "mean":
+        return q_values.mean(dim=ensemble_dim)
+    if method == "min":
+        return q_values.min(dim=ensemble_dim).values
+    if method == "subsample":
+        num_heads = q_values.shape[ensemble_dim]
+        if not 0 < subsample_size <= num_heads:
+            raise ValueError(
+                f"subsample_size must be in [1, {num_heads}], got {subsample_size}"
+            )
+        indices = torch.randperm(
+            num_heads, generator=generator, device=q_values.device
+        )[:subsample_size]
+        selected = q_values.index_select(ensemble_dim, indices)
+        return selected.min(dim=ensemble_dim).values
+    raise ValueError(f"Unsupported Q aggregation method: {method}")
+
+
+def aggregate_bon_q_values(
+    q_values: torch.Tensor,
+    subsample_size: Optional[int] = 2,
+    ensemble_dim: int = -1,
+    generator: Optional[torch.Generator] = None,
+    fallback_method: str = "min",
+) -> torch.Tensor:
+    """Build pessimistic Q scores for best-of-N action selection."""
+    if q_values.ndim == 0:
+        raise ValueError("q_values must include an ensemble dimension")
+    ensemble_dim = ensemble_dim % q_values.ndim
+    num_heads = q_values.shape[ensemble_dim]
+    if num_heads < 1:
+        raise ValueError("q_values must contain at least one Q head")
+    if subsample_size is None:
+        if fallback_method not in {"min", "mean"}:
+            raise ValueError("BON fallback_method must be either 'min' or 'mean'")
+        return aggregate_q_values(
+            q_values, method=fallback_method, ensemble_dim=ensemble_dim
+        )
+    if subsample_size < 1:
+        raise ValueError("BON subsample_size must be positive or None")
+    q_by_head = q_values.movedim(ensemble_dim, 0)
+    indices = torch.randint(
+        num_heads,
+        (subsample_size, *q_by_head.shape[1:]),
+        generator=generator,
+        device=q_values.device,
+    )
+    return q_by_head.gather(0, indices).min(dim=0).values
+
+
+def select_best_of_n(
+    actions: torch.Tensor, q_values: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select the highest-Q candidate independently for each batch item."""
+    if actions.ndim < 3 or q_values.ndim != 2:
+        raise ValueError(
+            "actions and q_values must have shapes [N, B, ...] and [N, B]"
+        )
+    if actions.shape[:2] != q_values.shape:
+        raise ValueError("actions and q_values candidate/batch dimensions must match")
+    best_indices = q_values.argmax(dim=0)
+    batch_indices = torch.arange(actions.shape[1], device=actions.device)
+    return (
+        actions[best_indices, batch_indices],
+        q_values[best_indices, batch_indices],
+        best_indices,
+    )
+
+
+def compute_one_step_td_target(
+    rewards: torch.Tensor,
+    terminations: torch.Tensor,
+    next_q: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Compute a Bellman target that still bootstraps across truncations."""
+    if rewards.shape != terminations.shape or rewards.shape != next_q.shape:
+        raise ValueError("rewards, terminations, and next_q must have matching shapes")
+    return rewards + gamma * (~terminations.bool()).to(rewards.dtype) * next_q
+
+
 def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
     return torch.where(
         error.abs() < delta, 0.5 * error**2, delta * (error.abs() - 0.5 * delta)

@@ -220,6 +220,7 @@ class ManiskillEnv(gym.Env):
             reward += info["is_src_obj_grasped"] * 0.1
             reward += info["consecutive_grasp"] * 0.1
             reward += (info["success"] & info["is_src_obj_grasped"]) * 1.0
+        reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
         # diff
         reward_diff = reward - self.prev_step_reward
         self.prev_step_reward = reward
@@ -324,7 +325,7 @@ class ManiskillEnv(gym.Env):
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
         return extracted_obs, step_reward, terminations, truncations, infos
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, stop_on_done=False):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []
@@ -332,17 +333,74 @@ class ManiskillEnv(gym.Env):
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
+        active = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        terminal_obs = {}
+        terminal_episode_info = {}
+
+        def capture_masked_tensors(destination, source, mask):
+            """Save the first terminal batched tensor values selected by mask."""
+            if not isinstance(source, dict):
+                return
+            for key, value in source.items():
+                if isinstance(value, dict):
+                    nested_destination = destination.setdefault(key, {})
+                    capture_masked_tensors(nested_destination, value, mask)
+                elif (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == mask.numel()
+                ):
+                    if key not in destination:
+                        destination[key] = value.clone()
+                    else:
+                        destination[key][mask] = value[mask]
+
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
+            if stop_on_done and (~active).any():
+                # Keep already-finished vector envs inert until the whole chunk ends.
+                # Their outputs are masked below and they are reset before the next
+                # policy inference, so stale chunk actions never enter a new episode.
+                if isinstance(actions, torch.Tensor):
+                    actions = actions.clone()
+                    actions[~active.to(actions.device)] = 0
+                else:
+                    actions = np.array(actions, copy=True)
+                    actions[(~active).detach().cpu().numpy()] = 0
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
+            inactive = ~active
+            if stop_on_done and inactive.any():
+                capture_masked_tensors(extracted_obs, terminal_obs, inactive)
+                capture_masked_tensors(
+                    infos.get("episode", {}),
+                    terminal_episode_info,
+                    inactive,
+                )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
 
-            chunk_rewards.append(step_reward)
-            raw_chunk_terminations.append(terminations)
-            raw_chunk_truncations.append(truncations)
+            step_terminations = terminations & active if stop_on_done else terminations
+            step_truncations = truncations & active if stop_on_done else truncations
+            step_dones = torch.logical_or(step_terminations, step_truncations)
+            if stop_on_done and step_dones.any():
+                capture_masked_tensors(terminal_obs, extracted_obs, step_dones)
+                capture_masked_tensors(
+                    terminal_episode_info,
+                    infos.get("episode", {}),
+                    step_dones,
+                )
+
+            chunk_rewards.append(
+                step_reward * active.to(step_reward.dtype)
+                if stop_on_done
+                else step_reward
+            )
+            raw_chunk_terminations.append(step_terminations)
+            raw_chunk_truncations.append(step_truncations)
+            if stop_on_done:
+                active = active & ~step_dones
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
@@ -360,12 +418,30 @@ class ManiskillEnv(gym.Env):
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(
                 past_dones, obs_list[-1], infos_list[-1]
             )
+            if stop_on_done:
+                final_observation = infos_list[-1].get("final_observation")
+                if isinstance(final_observation, dict):
+                    capture_masked_tensors(
+                        final_observation, terminal_obs, past_dones
+                    )
+                final_info = infos_list[-1].get("final_info")
+                if isinstance(final_info, dict):
+                    capture_masked_tensors(
+                        final_info.get("episode", {}),
+                        terminal_episode_info,
+                        past_dones,
+                    )
 
         chunk_terminations = torch.zeros_like(raw_chunk_terminations)
         chunk_terminations[:, -1] = past_terminations
 
         chunk_truncations = torch.zeros_like(raw_chunk_truncations)
         chunk_truncations[:, -1] = past_truncations
+
+        # Keep the public macro-step termination tensors unchanged, but expose the
+        # original substep boundaries to replay consumers that store atomic steps.
+        infos_list[-1]["_raw_chunk_terminations"] = raw_chunk_terminations
+        infos_list[-1]["_raw_chunk_truncations"] = raw_chunk_truncations
         return (
             obs_list,
             chunk_rewards,

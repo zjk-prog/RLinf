@@ -37,13 +37,16 @@ class QHead(nn.Module):
         hidden_dims,
         output_dim=1,
         train_action_encoder=False,
+        activation="tanh",
+        use_layer_norm=True,
+        initializer="legacy",
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.action_feature_dim = action_feature_dim
         self.train_action_encoder = train_action_encoder
 
-        self.nonlinearity = "tanh"
+        self.nonlinearity = activation
 
         if self.train_action_encoder:
             self.action_encoder = nn.Sequential(
@@ -64,14 +67,25 @@ class QHead(nn.Module):
                     output_dim,
                 ],
                 act_builder=get_act_func(self.nonlinearity),
-                use_layer_norm=True,
+                use_layer_norm=use_layer_norm,
                 last_act=False,
             )
         )
 
-        self._init_weights(self.nonlinearity)
+        self._init_weights(self.nonlinearity, initializer=initializer)
 
-    def _init_weights(self, nonlinearity="relu"):
+    def _init_weights(self, nonlinearity="relu", *, initializer):
+        if initializer not in {"legacy", "xavier_uniform"}:
+            raise ValueError(f"Unsupported Q-head initializer: {initializer}")
+
+        if initializer == "xavier_uniform":
+            for module in self.net:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            return
+
         if nonlinearity == "tanh":
             gain = nn.init.calculate_gain("tanh")
         else:
@@ -87,6 +101,8 @@ class QHead(nn.Module):
                     if nonlinearity == "tanh":
                         # tanh: Xavier
                         nn.init.xavier_uniform_(m.weight, gain=gain)
+                    elif nonlinearity == "gelu":
+                        nn.init.xavier_uniform_(m.weight)
                     else:
                         # relu: Kaiming
                         nn.init.kaiming_normal_(
@@ -130,6 +146,9 @@ class MultiQHead(nn.Module):
         num_q_heads=2,
         output_dim=1,
         train_action_encoder=False,
+        activation="tanh",
+        use_layer_norm=True,
+        initializer="legacy",
     ):
         super().__init__()
 
@@ -143,6 +162,9 @@ class MultiQHead(nn.Module):
                     hidden_dims,
                     output_dim,
                     train_action_encoder,
+                    activation,
+                    use_layer_norm,
+                    initializer,
                 )
             )
         self.qs = nn.ModuleList(qs)
