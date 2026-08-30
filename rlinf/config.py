@@ -1068,6 +1068,66 @@ def validate_embodied_cfg(cfg):
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
 
+    if (
+        cfg.algorithm.loss_type == "embodied_ogpo"
+        and cfg.runner.get("execution_mode", "sync") == "async"
+    ):
+        assert not only_eval, "Async OGPO is training-only"
+        assert cfg.runner.val_check_interval <= 0, (
+            "Async OGPO does not support inline evaluation"
+        )
+        assert cfg.algorithm.get("update_epoch", 1) == 1, (
+            "Async OGPO counts one update epoch per runner step"
+        )
+        assert not cfg.actor.get("enable_offload", False), (
+            "Async OGPO does not support actor offload"
+        )
+        assert not cfg.rollout.get("enable_offload", False), (
+            "Async OGPO does not support rollout offload"
+        )
+        assert cfg.actor.get("sync_weight_no_wait", False), (
+            "Async OGPO requires boundary-safe background weight receiving"
+        )
+        assert cfg.actor.get("replay_channel_size", 0) > 0
+        assert cfg.actor.get("recv_queue_size", 0) > 0
+        assert cfg.actor.get("recv_drain_max_trajectories", 0) > 0
+        stop_data_collection_after_steps = cfg.runner.get(
+            "stop_data_collection_after_steps", -1
+        )
+        assert isinstance(stop_data_collection_after_steps, int) and not isinstance(
+            stop_data_collection_after_steps, bool
+        ), "runner.stop_data_collection_after_steps must be an integer"
+        assert (
+            stop_data_collection_after_steps == -1
+            or stop_data_collection_after_steps > 0
+        ), (
+            "runner.stop_data_collection_after_steps must be -1 (disabled) "
+            "or a positive learner-step count"
+        )
+        assert stage_num == 1, "Async OGPO currently supports one rollout stage"
+        for component in ("actor", "env", "rollout"):
+            assert component_placement.get_world_size(component) == 1, (
+                f"Async OGPO currently supports one {component} rank"
+            )
+        assert not cfg.runner.get("enable_decoupled_mode", False), (
+            "Async OGPO currently requires the coupled env/rollout channel mode"
+        )
+        assert cfg.weight_syncer.type == "patch", (
+            "Async OGPO requires PatchWeightSyncer"
+        )
+        assert cfg.weight_syncer.patch.init_sync.enabled, (
+            "Async OGPO requires a full initial weight sync"
+        )
+        assert cfg.weight_syncer.patch.init_sync.get("prefixes") is None, (
+            "Async OGPO initial sync must include target actor and target Q"
+        )
+        save_interval = int(cfg.runner.save_interval)
+        weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
+        assert weight_sync_interval > 0
+        assert save_interval <= 0 or save_interval % weight_sync_interval == 0, (
+            "Async OGPO save_interval must align with weight_sync_interval"
+        )
+
     use_reward_model = cfg.get("reward", {}).get("use_reward_model", False)
     standalone_realworld = cfg.get("reward", {}).get("standalone_realworld", False)
     if use_reward_model and not standalone_realworld:

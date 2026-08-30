@@ -100,7 +100,9 @@ class EmbodiedRunner:
         # Data channels
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
+        self.actor_channel = Channel.create(
+            "Actor", maxsize=int(self.cfg.actor.get("replay_channel_size", 0))
+        )
         if self.reward is not None:
             self.reward_channel = Channel.create("Reward")
         else:

@@ -45,7 +45,17 @@ def main(cfg) -> None:
     # Create actor worker group
     actor_placement = component_placement.get_strategy("actor")
 
-    if cfg.algorithm.loss_type == "embodied_sac":
+    if cfg.algorithm.loss_type == "embodied_ogpo":
+        if cfg.runner.get("execution_mode") != "async":
+            raise ValueError("Async OGPO requires runner.execution_mode=async")
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.async_fsdp_ogpo_policy_worker import (
+            AsyncEmbodiedOGPOFSDPPolicy,
+        )
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncEmbodiedOGPOFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_sac":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
             AsyncEmbodiedSACFSDPPolicy,

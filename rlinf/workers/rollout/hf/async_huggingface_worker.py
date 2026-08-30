@@ -42,6 +42,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
+        self._blocking_boundary_weight_sync = (
+            self.cfg.algorithm.loss_type == "embodied_ogpo"
+        )
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -133,6 +136,13 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         if self._weight_sync_work is None:
             return
 
+        if self._blocking_boundary_weight_sync:
+            await self._weight_sync_work
+            self._weight_sync_work = None
+            self._weight_sync_apply_total += 1
+            self._start_background_weight_sync_if_needed()
+            return
+
         if not self._weight_sync_work.done():
             return
 
@@ -148,7 +158,18 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         if self._weight_sync_requested or self._weight_sync_work is not None:
             self._weight_sync_coalesced_total += 1
         self._weight_sync_requested = True
-        self._start_background_weight_sync_if_needed()
+        if not self._blocking_boundary_weight_sync:
+            self._start_background_weight_sync_if_needed()
+
+    async def wait_for_actor_sync_model(self) -> None:
+        """Wait until a requested boundary-safe weight update is applied."""
+        while self._weight_sync_requested:
+            if self._generate_task is not None and self._generate_task.done():
+                await self._generate_task
+                raise RuntimeError("Async rollout stopped before applying weights")
+            await asyncio.sleep(0.01)
+        if self._weight_sync_work is not None:
+            await asyncio.shield(self._weight_sync_work)
 
     async def decoupled_generate_one_epoch(
         self, input_channel: Channel, output_channel: Channel

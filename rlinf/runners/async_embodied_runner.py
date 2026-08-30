@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (
         AsyncEmbodiedDAGGERFSDPPolicy,
     )
+    from rlinf.workers.actor.async_fsdp_ogpo_policy_worker import (
+        AsyncEmbodiedOGPOFSDPPolicy,
+    )
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
     )
@@ -42,7 +45,11 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
     def __init__(
         self,
         cfg: DictConfig,
-        actor: Union["AsyncEmbodiedSACFSDPPolicy", "AsyncEmbodiedDAGGERFSDPPolicy"],
+        actor: Union[
+            "AsyncEmbodiedSACFSDPPolicy",
+            "AsyncEmbodiedDAGGERFSDPPolicy",
+            "AsyncEmbodiedOGPOFSDPPolicy",
+        ],
         rollout: "AsyncMultiStepRolloutWorker",
         env: "AsyncEnvWorker",
         reward: "EmbodiedRewardWorker",
@@ -58,6 +65,32 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
         self.sync_weight_no_wait = self.cfg.actor.get("sync_weight_no_wait", False)
+        self._is_async_ogpo = self.cfg.algorithm.loss_type == "embodied_ogpo"
+        self.stop_data_collection_after_steps = int(
+            self.cfg.runner.get("stop_data_collection_after_steps", -1)
+        )
+        self._replay_buffer_frozen = False
+        self._async_pipeline_started = False
+
+    def _maybe_freeze_replay_buffer(self) -> bool:
+        """Freeze async OGPO replay writes at the configured learner step."""
+        if (
+            not self._is_async_ogpo
+            or self._replay_buffer_frozen
+            or self.stop_data_collection_after_steps < 0
+            or self.global_step < self.stop_data_collection_after_steps
+        ):
+            return False
+
+        self.logger.info(
+            "Freezing the async OGPO replay buffer at learner step %d; env and "
+            "rollout will continue for metrics while actor and critic train from "
+            "the frozen buffer.",
+            self.global_step,
+        )
+        self.actor.freeze_replay_buffer().wait()
+        self._replay_buffer_frozen = True
+        return True
 
     def get_env_metrics(self) -> tuple[dict, list[dict], list[dict]]:
         results: list[dict] = []
@@ -120,6 +153,14 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         return True
 
     def update_rollout_weights(self, no_wait=False):
+        if self._is_async_ogpo:
+            if not self._async_pipeline_started:
+                return super().update_rollout_weights()
+            self.rollout.request_actor_sync_model().wait()
+            self.actor.sync_model_to_rollout().wait()
+            self.rollout.wait_for_actor_sync_model().wait()
+            return
+
         if not no_wait:
             return super().update_rollout_weights()
 
@@ -157,8 +198,16 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+        if self._is_async_ogpo:
+            self.actor.set_global_step(self.global_step).wait()
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
+        actor_handle = None
+        if self._is_async_ogpo:
+            actor_handle = self.actor.recv_rollout_trajectories(
+                input_channel=self.actor_channel
+            )
+            actor_handle.wait()
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
@@ -176,9 +225,12 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 input_channel=self.reward_channel,
                 output_channel=self.env_channel,
             )
-        actor_handle: Handle = self.actor.recv_rollout_trajectories(
-            input_channel=self.actor_channel
-        )
+        if actor_handle is None:
+            actor_handle = self.actor.recv_rollout_trajectories(
+                input_channel=self.actor_channel
+            )
+        self._async_pipeline_started = True
+        self._maybe_freeze_replay_buffer()
 
         while self.global_step < self.max_steps:
             # Use the step we're ABOUT to run as the profiling key, mirroring
@@ -199,7 +251,10 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
                 if not skip_step:
                     self.global_step += 1
+                    self._maybe_freeze_replay_buffer()
                     if self.global_step % self.weight_sync_interval == 0:
+                        if self._is_async_ogpo:
+                            self.actor.set_global_step(self.global_step).wait()
                         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
                     training_metrics = {

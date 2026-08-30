@@ -1,0 +1,55 @@
+defaults:
+  - maniskill_ogpo_flow_state
+  - _self_
+
+runner:
+  execution_mode: async
+  logger:
+    experiment_name: "maniskill_ogpo_flow_state_async"
+  # The synchronous config performs eight update epochs per runner step.
+  max_epochs: 64000
+  val_check_interval: -1
+  save_interval: 20000
+  weight_sync_interval: 10
+  stop_data_collection_after_steps: -1
+
+algorithm:
+  update_epoch: 1
+  replay_buffer:
+    enable_cache: True
+    cache_size: 200000
+    sample_window_size: 200000
+    min_buffer_size: 100
+    auto_save: False
+    save_buffer_checkpoint: False
+  ogpo:
+    clip_randn: True
+    randn_clip_value: 3.0
+    clip_intermediate_actions: True
+    ignore_last: False
+    actor_tau: 0.005
+    critic_tau: 0.01
+    q_utd: 8
+    pi_utd: 2
+    use_success_buffer_q: false
+    q_warmup_steps: 200
+
+actor:
+  sync_weight_no_wait: true
+  replay_channel_size: 64
+  recv_queue_size: 2048
+  recv_drain_max_trajectories: 2048
+  global_batch_size: 2048
+  micro_batch_size: 2048
+  optim:
+    clip_grad: 10.0
+    lr: 9.0e-5
+    lr_scheduler: torch_constant
+  critic_optim:
+    clip_grad: 1.0
+    lr: 9.0e-5
+    lr_scheduler: torch_constant
+
+env:
+  train:
+    total_num_envs: 8

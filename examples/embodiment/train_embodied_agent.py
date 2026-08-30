@@ -37,6 +37,11 @@ _REWARD_SERVER_COMPONENT_NAME = "reward_server"
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
+    if (
+        cfg.algorithm.loss_type == "embodied_ogpo"
+        and cfg.runner.get("execution_mode", "sync") != "sync"
+    ):
+        raise ValueError("Async OGPO must be launched with run_async.sh")
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(
