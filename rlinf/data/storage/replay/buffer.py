@@ -777,26 +777,73 @@ class TrajectoryReplayBuffer:
         traj_ids_tensor: torch.Tensor,
         local_sample_indices: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Gather arbitrary local transition indices from replay trajectories."""
-        chunks = []
-        for trajectory_id, local_index in zip(
-            traj_ids_tensor.tolist(), local_sample_indices.tolist()
-        ):
-            cached = (
-                self._flat_trajectory_cache.get(trajectory_id)
-                if self._flat_trajectory_cache is not None
-                else None
-            )
-            if cached is None:
+        """Gather arbitrary local transition indices with batched tensor indexing."""
+        num_samples = int(traj_ids_tensor.numel())
+        batch_indices_tensor = torch.arange(num_samples, dtype=torch.long)
+        batch = None
+
+        cache = self._flat_trajectory_cache
+        if cache is not None:
+            cached_ids = list(cache.cache.keys())
+            if cached_ids:
+                cached_ids_tensor = torch.as_tensor(cached_ids, dtype=torch.long)
+                cached_mask = torch.isin(traj_ids_tensor, cached_ids_tensor)
+            else:
+                cached_mask = torch.zeros_like(traj_ids_tensor, dtype=torch.bool)
+        else:
+            cached_mask = torch.zeros_like(traj_ids_tensor, dtype=torch.bool)
+
+        # Gather cache hits directly from the flat cache buffer.
+        if torch.any(cached_mask):
+            cache_buffer = cache.get_buffer()
+            slot_len = cache.get_slot_length()
+            if cache_buffer is not None and slot_len is not None:
+                cached_traj_ids = traj_ids_tensor[cached_mask].tolist()
+                cached_slots = torch.as_tensor(
+                    [cache.cache[trajectory_id] for trajectory_id in cached_traj_ids],
+                    dtype=torch.long,
+                )
+                cached_local = local_sample_indices[cached_mask]
+                buffer_indices = cached_slots * slot_len + cached_local
+                batch_indices = batch_indices_tensor[cached_mask]
+                batch = self._init_batch_from_buffer(cache_buffer, num_samples)
+                self._fill_batch_from_buffer_indices(
+                    batch, cache_buffer, buffer_indices, batch_indices
+                )
+
+        # Load cache misses once per trajectory, then gather all samples in one pass.
+        miss_mask = ~cached_mask
+        if torch.any(miss_mask):
+            miss_traj_ids = torch.unique(traj_ids_tensor[miss_mask]).tolist()
+            miss_flats: list[dict] = []
+            traj_offsets: dict[int, int] = {}
+            cursor = 0
+            for trajectory_id in miss_traj_ids:
                 model_weights_id = self._trajectory_index[trajectory_id][
                     "model_weights_id"
                 ]
                 trajectory = self._load_trajectory(trajectory_id, model_weights_id)
-                cached = self._flatten_trajectory(trajectory)
-                if self._flat_trajectory_cache is not None:
-                    self._flat_trajectory_cache.put(trajectory_id, cached)
-            chunks.append(self._extract_chunk_from_flat_trajectory(cached, local_index))
-        return self._merge_chunks_to_batch(chunks)
+                flat_trajectory = self._flatten_trajectory(trajectory)
+                miss_flats.append(flat_trajectory)
+                traj_offsets[trajectory_id] = cursor
+                cursor += self._trajectory_index[trajectory_id]["num_samples"]
+
+            concat_flat = self._concat_flat_trajectories(miss_flats)
+            if batch is None:
+                batch = self._init_batch_from_flat(concat_flat, num_samples)
+
+            miss_traj_ids_samples = traj_ids_tensor[miss_mask].tolist()
+            miss_offsets = torch.as_tensor(
+                [traj_offsets[trajectory_id] for trajectory_id in miss_traj_ids_samples],
+                dtype=torch.long,
+            )
+            miss_buffer_indices = miss_offsets + local_sample_indices[miss_mask]
+            miss_batch_indices = batch_indices_tensor[miss_mask]
+            self._fill_batch_from_buffer_indices(
+                batch, concat_flat, miss_buffer_indices, miss_batch_indices
+            )
+
+        return batch if batch is not None else {}
 
     @staticmethod
     def _expand_sequence_mask(mask: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
