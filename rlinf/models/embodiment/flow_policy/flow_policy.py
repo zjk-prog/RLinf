@@ -403,6 +403,7 @@ class FlowStateConfig:
     obs_dim: int = 29
     num_action_chunks: int = 1
     encoder_config: dict[str, Any] = field(default_factory=dict)
+    use_state_encoder: bool = True
     add_value_head: bool = False  # No visual_feature -> No mix_feature -> No value_head -> add_value_head must be false !
     add_q_head: bool = False
     q_head_type: str = "default"
@@ -463,17 +464,19 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         if self.cfg.num_action_chunks <= 0:
             raise ValueError("num_action_chunks must be positive")
 
-        # 3 layer MLP encoder for obs
-        self.backbone = nn.Sequential(
-            layer_init(nn.Linear(self.cfg.obs_dim, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-        )
-        # The flow actor receives the 256-dimensional state-backbone feature.
-        flow_obs_dim = 256
+        if self.cfg.use_state_encoder:
+            self.backbone = nn.Sequential(
+                layer_init(nn.Linear(self.cfg.obs_dim, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 256)),
+                nn.Tanh(),
+                layer_init(nn.Linear(256, 256)),
+                nn.Tanh(),
+            )
+            flow_obs_dim = 256
+        else:
+            self.backbone = nn.Identity()
+            flow_obs_dim = self.cfg.obs_dim
         flow_action_dim = self.cfg.action_dim * self.cfg.num_action_chunks
 
         # Action scaling for flow actor

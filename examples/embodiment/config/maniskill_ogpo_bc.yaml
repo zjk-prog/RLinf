@@ -21,6 +21,8 @@ actor:
   model:
     num_action_chunks: 4
     add_q_head: False
+    use_state_encoder: False
+    flow_mlp_hidden_dims: [512, 512, 512, 512]
 
 env:
   eval:

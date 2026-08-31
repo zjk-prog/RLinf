@@ -145,6 +145,7 @@ actor:
     obs_dim: 42
     action_dim: 4
     num_action_chunks: 4
+    use_state_encoder: False
     precision: "32"
     add_value_head: False
     add_q_head: True
@@ -156,7 +157,7 @@ actor:
     q_initializer: xavier_uniform
     flow_actor_type: OGPOFlowActor
     denoising_steps: 10
-    flow_mlp_hidden_dims: [256, 256, 256]
+    flow_mlp_hidden_dims: [512, 512, 512, 512]
     flow_mlp_activation: gelu
     flow_mlp_layer_norm: False
     time_embedding_type: sinusoidal
