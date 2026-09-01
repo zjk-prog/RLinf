@@ -22,10 +22,12 @@ from rlinf.config import validate_cfg
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.async_env_worker import AsyncEnvWorker
+from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
 from rlinf.workers.rollout.hf.async_huggingface_worker import (
     AsyncMultiStepRolloutWorker,
 )
+from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
 
@@ -48,13 +50,28 @@ def main(cfg) -> None:
     if cfg.algorithm.loss_type == "embodied_ogpo":
         if cfg.runner.get("execution_mode") != "async":
             raise ValueError("Async OGPO requires runner.execution_mode=async")
-        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
-        from rlinf.workers.actor.async_fsdp_ogpo_policy_worker import (
-            AsyncEmbodiedOGPOFSDPPolicy,
-        )
+        if cfg.runner.get("use_ogpo_async_pipeline", False):
+            from rlinf.runners.bounded_async_ogpo_runner import (
+                BoundedAsyncOGPOEmbodiedRunner,
+            )
+            from rlinf.workers.actor.fsdp_ogpo_policy_worker import (
+                EmbodiedOGPOFSDPPolicy,
+            )
 
-        runner_cls = AsyncEmbodiedRunner
-        actor_worker_cls = AsyncEmbodiedOGPOFSDPPolicy
+            runner_cls = BoundedAsyncOGPOEmbodiedRunner
+            actor_worker_cls = EmbodiedOGPOFSDPPolicy
+            rollout_worker_cls = MultiStepRolloutWorker
+            env_worker_cls = EnvWorker
+        else:
+            from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+            from rlinf.workers.actor.async_fsdp_ogpo_policy_worker import (
+                AsyncEmbodiedOGPOFSDPPolicy,
+            )
+
+            runner_cls = AsyncEmbodiedRunner
+            actor_worker_cls = AsyncEmbodiedOGPOFSDPPolicy
+            rollout_worker_cls = AsyncMultiStepRolloutWorker
+            env_worker_cls = AsyncEnvWorker
     elif cfg.algorithm.loss_type == "embodied_sac":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
@@ -63,12 +80,16 @@ def main(cfg) -> None:
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncEmbodiedSACFSDPPolicy
+        rollout_worker_cls = AsyncMultiStepRolloutWorker
+        env_worker_cls = AsyncEnvWorker
     elif cfg.algorithm.loss_type == "rlt_ac":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import AsyncRLTACFSDPPolicy
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncRLTACFSDPPolicy
+        rollout_worker_cls = AsyncMultiStepRolloutWorker
+        env_worker_cls = AsyncEnvWorker
     elif cfg.algorithm.loss_type == "embodied_dagger":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (
@@ -77,12 +98,16 @@ def main(cfg) -> None:
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncEmbodiedDAGGERFSDPPolicy
+        rollout_worker_cls = AsyncMultiStepRolloutWorker
+        env_worker_cls = AsyncEnvWorker
     elif cfg.algorithm.loss_type == "decoupled_actor_critic":
         from rlinf.runners.async_ppo_embodied_runner import AsyncPPOEmbodiedRunner
         from rlinf.workers.actor.async_ppo_fsdp_worker import AsyncPPOEmbodiedFSDPActor
 
         runner_cls = AsyncPPOEmbodiedRunner
         actor_worker_cls = AsyncPPOEmbodiedFSDPActor
+        rollout_worker_cls = AsyncMultiStepRolloutWorker
+        env_worker_cls = AsyncEnvWorker
     else:
         raise ValueError(
             f"Unsupported loss type {cfg.algorithm.loss_type} for async embodied runner"
@@ -93,13 +118,13 @@ def main(cfg) -> None:
     )
     # Create rollout worker group
     rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = AsyncMultiStepRolloutWorker.create_group(cfg).launch(
+    rollout_group = rollout_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
     )
 
     # Create env worker group
     env_placement = component_placement.get_strategy("env")
-    env_group = AsyncEnvWorker.create_group(cfg).launch(
+    env_group = env_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.env.group_name, placement_strategy=env_placement
     )
 

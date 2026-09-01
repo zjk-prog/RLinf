@@ -4,6 +4,8 @@ defaults:
 
 runner:
   execution_mode: async
+  # False uses fully decoupled collection; True bounds policy lag to one batch.
+  use_ogpo_async_pipeline: true
   logger:
     experiment_name: "maniskill_ogpo_flow_state_async"
   # The synchronous config performs eight update epochs per runner step.
@@ -52,4 +54,4 @@ actor:
 
 env:
   train:
-    total_num_envs: 8
+    total_num_envs: 32
