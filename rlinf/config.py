@@ -1076,9 +1076,15 @@ def validate_embodied_cfg(cfg):
         assert cfg.runner.val_check_interval <= 0, (
             "Async OGPO does not support inline evaluation"
         )
-        assert cfg.algorithm.get("update_epoch", 1) == 1, (
-            "Async OGPO counts one update epoch per runner step"
-        )
+        update_epoch = int(cfg.algorithm.get("update_epoch", 1))
+        if cfg.runner.get("use_ogpo_async_pipeline", False):
+            assert update_epoch > 0, (
+                "Bounded async OGPO requires a positive update_epoch"
+            )
+        else:
+            assert update_epoch == 1, (
+                "Fully decoupled async OGPO counts one update epoch per runner step"
+            )
         assert not cfg.actor.get("enable_offload", False), (
             "Async OGPO does not support actor offload"
         )
