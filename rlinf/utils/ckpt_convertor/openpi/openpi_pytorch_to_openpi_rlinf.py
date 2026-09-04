@@ -227,12 +227,27 @@ def old_to_new_state_dict(
             ("input_layernorm", "pre_attention_norms"),
             ("post_attention_layernorm", "pre_ffw_norms"),
         ]:
+            # Pi0 uses regular RMSNorm weights for the action expert.
+            source_key = f"{source_prefix}{source_name}.weight"
+            if source_key in openpi_pytorch_state_dict:
+                openpi_rlinf_state_dict[
+                    f"{target_prefix}{target_name}.1.scale"
+                ] = openpi_pytorch_state_dict[source_key]
+
+            # Pi0.5 uses adaptive RMSNorm projections.
             for suffix in (".weight", ".bias"):
                 source_key = f"{source_prefix}{source_name}.dense{suffix}"
                 if source_key in openpi_pytorch_state_dict:
                     openpi_rlinf_state_dict[
                         f"{target_prefix}{target_name}.1.ada_modulation{suffix}"
                     ] = openpi_pytorch_state_dict[source_key]
+
+    # Pi0 uses a regular final RMSNorm for the action expert.
+    source_key = _GEMMA_EXPERT + "norm.weight"
+    if source_key in openpi_pytorch_state_dict:
+        openpi_rlinf_state_dict["llm.final_norms.1.scale"] = (
+            openpi_pytorch_state_dict[source_key]
+        )
 
     for suffix in (".weight", ".bias"):
         source_key = _GEMMA_EXPERT + "norm.dense" + suffix
