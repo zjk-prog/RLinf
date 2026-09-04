@@ -154,12 +154,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
     def update_rollout_weights(self, no_wait=False):
         if self._is_async_ogpo:
-            if not self._async_pipeline_started:
-                return super().update_rollout_weights()
-            self.rollout.request_actor_sync_model().wait()
-            self.actor.sync_model_to_rollout().wait()
-            self.rollout.wait_for_actor_sync_model().wait()
-            return
+            return super().update_rollout_weights()
 
         if not no_wait:
             return super().update_rollout_weights()

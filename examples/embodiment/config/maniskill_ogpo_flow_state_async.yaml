@@ -16,7 +16,7 @@ runner:
   stop_data_collection_after_steps: -1
 
 algorithm:
-  update_epoch: 8 # must be 1 when using decoupled async pipeline(use_bounded_async_ogpo: false) 
+  update_epoch: 8
   replay_buffer:
     enable_cache: True
     cache_size: 200000
@@ -34,7 +34,7 @@ algorithm:
     q_utd: 8
     pi_utd: 2
     use_success_buffer_q: false
-    q_warmup_steps: 200
+    q_warmup_steps: 100
 
 actor:
   sync_weight_no_wait: true

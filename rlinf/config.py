@@ -1077,22 +1077,14 @@ def validate_embodied_cfg(cfg):
             "Async OGPO does not support inline evaluation"
         )
         update_epoch = int(cfg.algorithm.get("update_epoch", 1))
-        if cfg.runner.get("use_bounded_async_ogpo", False):
-            assert update_epoch > 0, (
-                "Bounded async OGPO requires a positive update_epoch"
-            )
-        else:
-            assert update_epoch == 1, (
-                "Fully decoupled async OGPO counts one update epoch per runner step"
+        assert update_epoch > 0, (
+                "async OGPO requires a positive update_epoch"
             )
         assert not cfg.actor.get("enable_offload", False), (
             "Async OGPO does not support actor offload"
         )
         assert not cfg.rollout.get("enable_offload", False), (
             "Async OGPO does not support rollout offload"
-        )
-        assert cfg.actor.get("sync_weight_no_wait", False), (
-            "Async OGPO requires boundary-safe background weight receiving"
         )
         assert cfg.actor.get("replay_channel_size", 0) > 0
         assert cfg.actor.get("recv_queue_size", 0) > 0
@@ -1118,15 +1110,17 @@ def validate_embodied_cfg(cfg):
         assert not cfg.runner.get("enable_decoupled_mode", False), (
             "Async OGPO currently requires the coupled env/rollout channel mode"
         )
-        assert cfg.weight_syncer.type == "patch", (
-            "Async OGPO requires PatchWeightSyncer"
+        weight_syncer_type = cfg.weight_syncer.type
+        assert weight_syncer_type in ("patch", "bucket"), (
+            "Async OGPO requires PatchWeightSyncer or BucketWeightSyncer"
         )
-        assert cfg.weight_syncer.patch.init_sync.enabled, (
-            "Async OGPO requires a full initial weight sync"
-        )
-        assert cfg.weight_syncer.patch.init_sync.get("prefixes") is None, (
-            "Async OGPO initial sync must include target actor and target Q"
-        )
+        if weight_syncer_type == "patch":
+            assert cfg.weight_syncer.patch.init_sync.enabled, (
+                "Async OGPO requires a full initial weight sync"
+            )
+            assert cfg.weight_syncer.patch.init_sync.get("prefixes") is None, (
+                "Async OGPO initial sync must include target actor and target Q"
+            )
         save_interval = int(cfg.runner.save_interval)
         weight_sync_interval = int(cfg.runner.get("weight_sync_interval", 1))
         assert weight_sync_interval > 0
