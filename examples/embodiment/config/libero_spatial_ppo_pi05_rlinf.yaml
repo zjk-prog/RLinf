@@ -1,7 +1,6 @@
 defaults:
   - env/libero_spatial@env.train
   - env/libero_spatial@env.eval
-  - model/pi0_rlinf@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
@@ -23,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_ppo_openpi_rlinf"
+    experiment_name: "libero_spatial_ppo_pi05_rlinf"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -95,10 +94,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    # Accepts an OpenPI model.safetensors checkpoint (legacy keys are converted
-    # in memory) or an openpi_rlinf FSDP SFT checkpoint directory. The directory
-    # must also contain physical-intelligence/libero/norm_stats.json.
-    model_path: "/mnt/public2/zjk/ogpo/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
+    model_path: "/mnt/public2/zjk/ogpo/RLinf-Pi05-LIBERO-SFT"
     precision: ${actor.model.precision}
 
 actor:
@@ -110,7 +106,37 @@ actor:
   enable_offload: False
 
   model:
+    model_type: "openpi_rlinf"
     model_path: ${rollout.model.model_path}
+    precision: bf16
+    pi05: True
+    is_lora: False
+    lora_rank: 32
+    use_proprio: True
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 3
+    add_value_head: True
+    openpi:
+      task: rl
+      config_name: "pi05_libero"
+      num_images_in_input: 2
+      action_chunk: ${..num_action_chunks}
+      num_steps: ${..num_steps}
+      action_env_dim: ${..action_dim}
+      model_action_dim: 32
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 48
+      discrete_state_input: False
+      value_after_vlm: True
+      value_vlm_mode: "mean_token"
+      detach_critic_input: True
+      joint_logprob: False
+      ignore_last: False
+      noise_level: 0.5
+      noise_method: "flow_sde"
+      train_expert_only: True
 
   optim:
     lr: 5.0e-6
