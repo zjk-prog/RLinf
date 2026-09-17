@@ -187,6 +187,7 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             sequence_length=int(self.cfg.actor.model.num_action_chunks),
             discount=float(self.cfg.algorithm.gamma),
             success_only=success_only,
+            cross_episode=True,
         )
 
     def _sample_train_micro_batches(
@@ -209,7 +210,11 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         per_rank_batch = self.cfg.actor.global_batch_size // self._world_size
         ready = torch.tensor(
             int(
-                self.replay_buffer.get_sampleable_count(success_only=True)
+                self.replay_buffer.get_sampleable_count(
+                    success_only=True,
+                    sequence_length=int(self.cfg.actor.model.num_action_chunks),
+                    cross_episode=True,
+                )
                 >= per_rank_batch
             ),
             device=self.device,
@@ -222,7 +227,14 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
     def _replay_buffer_ready(self, min_buffer_size: int) -> bool:
         """Return whether every actor rank has enough replay trajectories."""
         ready = torch.tensor(
-            int(self.replay_buffer.is_ready(min_buffer_size)),
+            int(
+                self.replay_buffer.is_ready(min_buffer_size)
+                and self.replay_buffer.get_sampleable_count(
+                    sequence_length=int(self.cfg.actor.model.num_action_chunks),
+                    cross_episode=True,
+                )
+                > 0
+            ),
             device=self.device,
             dtype=torch.int32,
         )
