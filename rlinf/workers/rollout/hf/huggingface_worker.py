@@ -551,17 +551,34 @@ class MultiStepRolloutWorker(Worker):
                 "ogpo_use_sde": use_sde,
                 "ogpo_num_samples": int(num_samples),
                 "ogpo_noise_std": float(ogpo_cfg.constant_noise_std),
-                "ogpo_normalize_horizon": bool(ogpo_cfg.get("normalize_denoising_horizon", True)),
-                "ogpo_normalize_dimension": bool(ogpo_cfg.get("normalize_action_dimension", True)),
+                "ogpo_normalize_horizon": bool(
+                    ogpo_cfg.get("normalize_denoising_horizon", True)
+                ),
+                "ogpo_normalize_dimension": bool(
+                    ogpo_cfg.get("normalize_action_dimension", True)
+                ),
                 "ogpo_randn_clip_value": float(ogpo_cfg.get("randn_clip_value", 3.0)),
                 "ogpo_clip_randn": bool(ogpo_cfg.get("clip_randn", True)),
-                "ogpo_use_tapered_noise": bool(ogpo_cfg.get("use_tapered_noise", False)),
+                "ogpo_use_tapered_noise": bool(
+                    ogpo_cfg.get("use_tapered_noise", False)
+                ),
                 "ogpo_ignore_last": bool(ogpo_cfg.get("ignore_last", True)),
-                "ogpo_error_correct_sde_to_ode": bool(ogpo_cfg.get("error_correct_sde_to_ode", True)),
-                "ogpo_clip_intermediate_actions": bool(ogpo_cfg.get("clip_intermediate_actions", True)),
-                "ogpo_denoised_clip_value": float(ogpo_cfg.get("denoised_clip_value", 1.0)),
+                "ogpo_error_correct_sde_to_ode": bool(
+                    ogpo_cfg.get("error_correct_sde_to_ode", True)
+                ),
+                "ogpo_clip_intermediate_actions": bool(
+                    ogpo_cfg.get("clip_intermediate_actions", True)
+                ),
+                "ogpo_ode_clip_intermediate_actions": bool(
+                    ogpo_cfg.get("ode_clip_intermediate_actions", False)
+                ),
+                "ogpo_denoised_clip_value": float(
+                    ogpo_cfg.get("denoised_clip_value", 1.0)
+                ),
                 "ogpo_bon_subsample_heads": ogpo_cfg.get("bon_subsample_heads", 2),
-                "ogpo_bon_fallback_aggregation": ogpo_cfg.get("bon_fallback_aggregation", "min"),
+                "ogpo_bon_fallback_aggregation": ogpo_cfg.get(
+                    "bon_fallback_aggregation", "min"
+                ),
                 "ogpo_bon_generator": self.ogpo_bon_generator,
             }
 

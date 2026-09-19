@@ -633,7 +633,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         self,
         obs,
         num_samples: int = 1,
-        clip_intermediate: bool = True,
+        clip_intermediate: bool = False,
         clip_value: float = 1.0,
     ):
         """Sample actions from the BC flow with deterministic ODE integration."""
@@ -808,7 +808,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 env_obs,
                 num_samples=1,
                 clip_intermediate=bool(
-                    kwargs.get("ogpo_clip_intermediate_actions", True)
+                    kwargs.get("ogpo_ode_clip_intermediate_actions", False)
                 ),
                 clip_value=float(kwargs.get("ogpo_denoised_clip_value", 1.0)),
             )[0]

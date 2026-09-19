@@ -59,6 +59,7 @@ algorithm:
     ignore_last: False
     error_correct_sde_to_ode: True
     clip_intermediate_actions: True
+    ode_clip_intermediate_actions: False
     denoised_clip_value: 1.0
     normalize_denoising_horizon: True
     normalize_action_dimension: True

@@ -516,7 +516,7 @@ class OGPOFlowMixin:
         self,
         obs: torch.Tensor,
         num_samples: int = 1,
-        clip_intermediate: bool = True,
+        clip_intermediate: bool = False,
         clip_value: float = 1.0,
     ) -> torch.Tensor:
         """Sample actions with deterministic Euler integration after initialization."""
