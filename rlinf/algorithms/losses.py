@@ -317,14 +317,13 @@ def compute_flow_matching_bc_loss(
     target_velocity: torch.Tensor,
     valid_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
-    """Mask invalid action steps while retaining OGPO's full-size mean."""
+    """Compute flow-matching behavior-cloning loss on valid action steps."""
     element_loss = (predicted_velocity - target_velocity).square()
     if valid_mask is not None:
         while valid_mask.ndim < element_loss.ndim:
             valid_mask = valid_mask.unsqueeze(-1)
         valid_mask = valid_mask.expand_as(element_loss).bool()
-        element_loss = element_loss * valid_mask.to(element_loss.dtype)
-    loss = element_loss.mean()
+    loss = masked_mean(element_loss, valid_mask)
     return loss, {"actor/bc_loss": loss.detach()}
 
 
@@ -335,7 +334,7 @@ def compute_q_td_loss(
     huber_delta: float = 1.0,
     valid_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
-    """Mask invalid TD rows while retaining OGPO's full-size mean."""
+    """Regress every Q head against a scalar TD target on valid rows."""
     while target_q.ndim < q_values.ndim:
         target_q = target_q.unsqueeze(-1)
     target_q = target_q.expand_as(q_values)
@@ -350,8 +349,7 @@ def compute_q_td_loss(
         while valid_mask.ndim < element_loss.ndim:
             valid_mask = valid_mask.unsqueeze(-1)
         valid_mask = valid_mask.expand_as(element_loss).bool()
-        element_loss = element_loss * valid_mask.to(element_loss.dtype)
-    loss = element_loss.mean()
+    loss = masked_mean(element_loss, valid_mask)
     return loss, {
         "critic/td_loss": loss.detach(),
         "critic/q_mean": masked_mean(q_values.detach(), valid_mask),
