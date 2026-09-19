@@ -305,7 +305,7 @@ class TrajectoryReplayBuffer:
         self._save_executor = ThreadPoolExecutor(max_workers=20)
         # Separate executor for checkpoint saves
         self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
-        self._index_lock = threading.RLock()
+        self._index_lock = threading.Lock()
 
         # Cached window metadata for faster sampling
         self._window_cache_size = None
@@ -314,7 +314,7 @@ class TrajectoryReplayBuffer:
         self._window_cache_cumulative_ends: list[int] = []
         self._window_cache_cumulative_ends_tensor: Optional[torch.Tensor] = None
         self._window_cache_total_samples = 0
-        self._sampling_window_cache: dict[bool | tuple[bool, int], dict] = {}
+        self._sampling_window_cache: dict[bool, dict] = {}
 
         # Buffer state
         self.size = 0  # Current number of trajectories
@@ -768,87 +768,9 @@ class TrajectoryReplayBuffer:
             }
             return window_ids, cumulative_ends_tensor, running
 
-    def get_sampleable_count(
-        self,
-        success_only: bool = False,
-        *,
-        sequence_length: int = 1,
-        cross_episode: bool = False,
-    ) -> int:
-        """Return the number of eligible starts under the requested sampling mode."""
-        if sequence_length <= 0:
-            raise ValueError("sequence_length must be positive")
-        if cross_episode:
-            window = self._get_concatenated_window(sequence_length, success_only)
-            return window["total"]
+    def get_sampleable_count(self, success_only: bool = False) -> int:
+        """Return the number of transition starts in the active sample window."""
         return self._get_sampling_window(success_only)[2]
-
-    def _get_concatenated_window(
-        self, sequence_length: int, success_only: bool
-    ) -> dict:
-        """Cache complete sequence starts, filtering only their first episode."""
-        key = (success_only, sequence_length)
-        with self._index_lock:
-            window_ids, ends, total = self._get_sampling_window(False)
-            cached = self._sampling_window_cache.get(key)
-            if (
-                cached is None
-                or cached["index_version"] != self._index_version
-                or cached["window_size"] != self.sample_window_size
-            ):
-                if ends is None:
-                    return {"total": 0}
-                starts = torch.cat([torch.zeros(1, dtype=torch.long), ends[:-1]])
-                lengths = (
-                    ends.clamp_max(total - sequence_length + 1) - starts
-                ).clamp_min(0)
-                if success_only:
-                    lengths *= torch.tensor(
-                        [
-                            self._trajectory_index[trajectory_id].get(
-                                "is_success", False
-                            )
-                            for trajectory_id in window_ids
-                        ],
-                        dtype=torch.long,
-                    )
-                cached = {
-                    "index_version": self._index_version,
-                    "window_size": self.sample_window_size,
-                    "starts": starts,
-                    "ids": torch.tensor(window_ids, dtype=torch.long),
-                    "eligible_ends": lengths.cumsum(0),
-                    "ends": ends,
-                    "total": int(lengths.sum()),
-                }
-                self._sampling_window_cache[key] = cached
-        return cached
-
-    def _sample_concatenated_indices(
-        self, batch_size: int, sequence_length: int, success_only: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample contiguous chunks including masked tails from following episodes."""
-        cached = self._get_concatenated_window(sequence_length, success_only)
-        num_starts = cached["total"]
-        if not num_starts:
-            raise RuntimeError(
-                "No complete sequence starts match the buffer window and success filter"
-            )
-        eligible_ends = cached["eligible_ends"]
-        sampled = torch.randint(
-            0, num_starts, (batch_size,), generator=self.random_generator
-        )
-        buckets = torch.bucketize(sampled, eligible_ends, right=True)
-        eligible_starts = torch.cat(
-            [torch.zeros(1, dtype=torch.long), eligible_ends[:-1]]
-        )
-        global_starts = cached["starts"][buckets] + sampled - eligible_starts[buckets]
-        indices = global_starts[:, None] + torch.arange(sequence_length)[None, :]
-        sequence_buckets = torch.bucketize(
-            indices.contiguous(), cached["ends"], right=True
-        )
-        ids = cached["ids"][sequence_buckets]
-        return ids, indices - cached["starts"][sequence_buckets]
 
     def _gather_samples(
         self,
@@ -934,39 +856,10 @@ class TrajectoryReplayBuffer:
         discount: float,
         *,
         success_only: bool = False,
-        cross_episode: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Sample sequences, optionally retaining OGPO's cross-episode tail inputs.
-
-        By default, repeat the last transition at an episode boundary. With
-        ``cross_episode=True``, read the following episode's transitions and
-        mask loss positions after the first done, as in OGPO_public.
-        """
+        """Sample fixed-length sequences without crossing episode boundaries."""
         if batch_size <= 0 or sequence_length <= 0:
             raise ValueError("batch_size and sequence_length must be positive")
-        if cross_episode:
-            repeated_ids, sequence_indices = self._sample_concatenated_indices(
-                batch_size, sequence_length, success_only
-            )
-        else:
-            repeated_ids, sequence_indices, valid = self._sample_episode_indices(
-                batch_size, sequence_length, success_only
-            )
-        flat_batch = self._gather_samples(
-            repeated_ids.reshape(-1), sequence_indices.reshape(-1)
-        )
-        if cross_episode:
-            dones = flat_batch["dones"].reshape(batch_size, sequence_length, -1).any(-1)
-            valid = torch.ones_like(dones)
-            valid[:, 1:] = ~dones.cummax(dim=1).values[:, :-1]
-        return self._build_sequence_batch(
-            flat_batch, batch_size, sequence_length, discount, valid, cross_episode
-        )
-
-    def _sample_episode_indices(
-        self, batch_size: int, sequence_length: int, success_only: bool
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample within episodes, repeating their final transition for padding."""
         window_ids, cumulative_ends, total_samples = self._get_sampling_window(
             success_only
         )
@@ -996,26 +889,16 @@ class TrajectoryReplayBuffer:
             sequence_indices, trajectory_lengths[:, None] - 1
         )
         repeated_ids = trajectory_ids[:, None].expand_as(sequence_indices)
-        return repeated_ids, sequence_indices, valid
-
-    def _build_sequence_batch(
-        self,
-        flat_batch: dict,
-        batch_size: int,
-        sequence_length: int,
-        discount: float,
-        valid: torch.Tensor,
-        cross_episode: bool,
-    ) -> dict[str, torch.Tensor]:
-        """Assemble sequence observations, actions, prefix rewards and masks."""
+        flat_batch = self._gather_samples(
+            repeated_ids.reshape(-1), sequence_indices.reshape(-1)
+        )
         actions = flat_batch["actions"].reshape(
             batch_size, sequence_length, *flat_batch["actions"].shape[1:]
         )
         rewards = flat_batch["rewards"].reshape(
             batch_size, sequence_length, *flat_batch["rewards"].shape[1:]
         )
-        prefix_mask = torch.ones_like(valid) if cross_episode else valid
-        reward_mask = self._expand_sequence_mask(prefix_mask, rewards).to(rewards.dtype)
+        reward_mask = self._expand_sequence_mask(valid, rewards).to(rewards.dtype)
         discounts = discount ** torch.arange(sequence_length, dtype=rewards.dtype)
         discounts = discounts.reshape(
             1, sequence_length, *([1] * (rewards.ndim - 2))
@@ -1041,7 +924,7 @@ class TrajectoryReplayBuffer:
             values = flat_batch[field].reshape(
                 batch_size, sequence_length, *flat_batch[field].shape[1:]
             ).bool()
-            field_mask = self._expand_sequence_mask(prefix_mask, values)
+            field_mask = self._expand_sequence_mask(valid, values)
             result[field] = torch.cummax(values & field_mask, dim=1).values
         return result
 
