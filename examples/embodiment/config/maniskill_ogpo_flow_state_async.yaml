@@ -5,7 +5,7 @@ defaults:
 runner:
   execution_mode: async
   # False uses fully decoupled collection; True bounds policy lag to one batch.
-  use_bounded_async_ogpo: true
+  use_bounded_async_ogpo: false
   logger:
     experiment_name: "maniskill_ogpo_flow_state_async"
   # The synchronous config performs eight update epochs per runner step.

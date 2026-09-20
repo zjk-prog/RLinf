@@ -35,7 +35,7 @@ from rlinf.data.schema.embodied_types import (
     convert_trajectories_to_batch,
     get_model_weights_id,
 )
-from rlinf.envs import get_env_cls
+from rlinf.envs import SupportedEnvType, get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import InsertDelay, RecordVideo
@@ -399,7 +399,7 @@ class EnvWorker(Worker):
     def _inject_realworld_reward_cfg(self, env_cfg: DictConfig):
         if not (self.use_reward_model and self.use_realworld_reward):
             return
-        if env_cfg.env_type != "realworld":
+        if SupportedEnvType(env_cfg.env_type) is not SupportedEnvType.REAL:
             return
 
         reward_placements = self._component_placement.get_strategy(
