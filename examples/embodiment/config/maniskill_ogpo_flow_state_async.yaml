@@ -16,7 +16,7 @@ runner:
   stop_data_collection_after_steps: -1
 
 algorithm:
-  update_epoch: 8
+  update_epoch: 1
   replay_buffer:
     enable_cache: True
     cache_size: 200000

@@ -134,9 +134,6 @@ class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
         )
         return time_metrics, ranked_time_metrics_list
 
-    def update_rollout_weights(self, no_wait=False):
-        super().update_rollout_weights(no_wait=no_wait and not self._is_async_ogpo)
-
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
