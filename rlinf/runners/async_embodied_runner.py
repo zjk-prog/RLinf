@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.runners.async_weight_sync_mixin import AsyncWeightSyncMixin
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
     )
 
 
-class AsyncEmbodiedRunner(EmbodiedRunner):
+class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
     def __init__(
         self,
         cfg: DictConfig,
@@ -61,10 +62,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
 
-        self._pending_rollout_weight_sync = None
-        self._weight_sync_coalesced_total = 0
-        self._weight_sync_request_total = 0
-        self.sync_weight_no_wait = self.cfg.actor.get("sync_weight_no_wait", False)
+        self.init_weight_sync_state()
         self._is_async_ogpo = self.cfg.algorithm.loss_type == "embodied_ogpo"
         self.stop_data_collection_after_steps = int(
             self.cfg.runner.get("stop_data_collection_after_steps", -1)
@@ -136,42 +134,6 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         )
         return time_metrics, ranked_time_metrics_list
 
-    def _cleanup_pending_rollout_weight_sync(self, no_wait):
-        if self._pending_rollout_weight_sync is None:
-            return True
-
-        rollout_handle, actor_handle = self._pending_rollout_weight_sync
-        self.logger.info(
-            f"Rollout handle done: {rollout_handle.done()}, actor handle done: {actor_handle.done()}"
-        )
-        if no_wait and (not rollout_handle.done() or not actor_handle.done()):
-            return False
-
-        rollout_handle.wait()
-        actor_handle.wait()
-        self._pending_rollout_weight_sync = None
-        return True
-
-    def update_rollout_weights(self, no_wait=False):
-        if self._is_async_ogpo:
-            return super().update_rollout_weights()
-
-        if not no_wait:
-            return super().update_rollout_weights()
-
-        self._weight_sync_request_total += 1
-        if not self._cleanup_pending_rollout_weight_sync(no_wait):
-            self._weight_sync_coalesced_total += 1
-            self.logger.info(
-                f"Weight sync coalesced {self._weight_sync_coalesced_total} times.\n"
-                f"Request total {self._weight_sync_request_total} times."
-            )
-            return
-
-        rollout_handle: Handle = self.rollout.request_actor_sync_model()
-        actor_handle: Handle = self.actor.sync_model_to_rollout()
-        self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
-
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
@@ -195,7 +157,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         start_time = time.time()
         if self._is_async_ogpo:
             self.actor.set_global_step(self.global_step).wait()
-        self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
+        self.update_rollout_weights()
 
         actor_handle = None
         if self._is_async_ogpo:
@@ -357,6 +319,9 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
+
+        # Let any in-flight non-blocking sync land before the workers go away.
+        self.drain_pending_rollout_weight_sync()
 
         self.env.stop().wait()
         self.rollout.stop().wait()
