@@ -182,6 +182,7 @@ class Pi0RL(EnvIO, Pi0):
         noise: torch.Tensor | None,
         rng: torch.Generator | None,
         compute_values: bool,
+        prefix_cache: tuple | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         rl_cfg = self.rl_cfg
         device = self.device
@@ -199,7 +200,11 @@ class Pi0RL(EnvIO, Pi0):
                 generator=rng,
             )
 
-        prefix_out, prefix_mask, kv_cache = self.build_prefix_cache(observation)
+        prefix_out, prefix_mask, kv_cache = (
+            self.build_prefix_cache(observation)
+            if prefix_cache is None
+            else prefix_cache
+        )
         vlm_value = None
         if rl_cfg.add_value_head and rl_cfg.value_after_vlm:
             vlm_value = rl_sampler.value_from_prefix(
@@ -421,16 +426,31 @@ class Pi0RL(EnvIO, Pi0):
 
     def default_forward(self, forward_inputs: dict[str, torch.Tensor], **kwargs):
         """PPO/GRPO recompute of logprobs and values from the stored chain."""
+        return self.recompute_chain_logprobs(
+            self._observation_from_forward_inputs(forward_inputs),
+            forward_inputs["chains"],
+            forward_inputs["denoise_inds"],
+            compute_values=kwargs.get("compute_values", True),
+        )
+
+    def recompute_chain_logprobs(
+        self,
+        observation: Observation,
+        chains: torch.Tensor,
+        denoise_inds: torch.Tensor,
+        *,
+        compute_values: bool = True,
+        prefix_cache: tuple | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Score saved PPO transitions, optionally reusing an observation cache."""
         rl_cfg = self.rl_cfg
-        compute_values = kwargs.get("compute_values", True)
-        chains = forward_inputs["chains"]
-        denoise_inds = forward_inputs["denoise_inds"]
         B = chains.shape[0]
         device = chains.device
-        observation = self._observation_from_forward_inputs(forward_inputs)
 
-        prefix_out, prefix_mask, kv_cache = self._build_prefix_cache_for_actor(
-            observation
+        prefix_out, prefix_mask, kv_cache = (
+            self._build_prefix_cache_for_actor(observation)
+            if prefix_cache is None
+            else prefix_cache
         )
 
         timesteps = rl_sampler.get_timesteps(self.num_steps, device)

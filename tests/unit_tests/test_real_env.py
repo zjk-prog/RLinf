@@ -4339,3 +4339,67 @@ def test_robotwin_eval_success_seed_order_is_controlled_by_base_seed():
 
     assert selected_seed_0 == selected_seed_0_again
     assert selected_seed_0 != selected_seed_1
+
+
+@pytest.mark.parametrize("first_success_only", [False, True])
+def test_libero_chunk_first_success_rewards(first_success_only):
+    """Keep full chunks and terminal observations, but reward success only once."""
+    from rlinf.envs.sim.libero.libero_env import LiberoEnv
+
+    successes = torch.tensor(
+        [[0, 1, 1, 1, 1], [0, 1, 0, 1, 0], [0, 0, 0, 0, 0]], dtype=torch.bool
+    )
+    timeout = torch.zeros_like(successes)
+    timeout[2, -1] = True
+
+    class ScriptedLiberoEnv(LiberoEnv):
+        def __init__(self):
+            self.use_only_first_success = first_success_only
+            self.skip_intermediate_renders = False
+            self.auto_reset = True
+            self.ignore_terminations = False
+            self.steps = 0
+            self.reset_calls = 0
+
+        def step(self, actions, auto_reset=True, _skip_obs_wrap=False):
+            assert not auto_reset
+            index = self.steps
+            self.steps += 1
+            return (
+                {"states": torch.full((3, 7), float(self.steps))},
+                successes[:, index].float(),
+                successes[:, index],
+                timeout[:, index],
+                {},
+            )
+
+        def _handle_auto_reset(self, dones, obs, infos):
+            assert self.steps == 5
+            assert dones.all()
+            self.reset_calls += 1
+            return (
+                {"states": torch.zeros(3, 7)},
+                {"final_observation": obs},
+                None,
+            )
+
+    env = ScriptedLiberoEnv()
+    observations, rewards, terminations, truncations, infos = env.chunk_step(
+        torch.zeros(3, 5, 7)
+    )
+    expected = successes.float()
+    if first_success_only:
+        expected = torch.tensor(
+            [[0, 1, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
+            dtype=torch.float32,
+        )
+    torch.testing.assert_close(rewards, expected)
+    assert env.steps == 5 and env.reset_calls == 1
+    expected_terminations = torch.zeros_like(successes)
+    expected_terminations[:2, -1] = True
+    torch.testing.assert_close(terminations, expected_terminations)
+    torch.testing.assert_close(truncations, timeout)
+    torch.testing.assert_close(observations[-1]["states"], torch.zeros(3, 7))
+    torch.testing.assert_close(
+        infos[-1]["final_observation"]["states"], torch.full((3, 7), 5.0)
+    )

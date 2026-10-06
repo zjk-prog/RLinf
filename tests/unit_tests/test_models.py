@@ -644,3 +644,286 @@ def test_delay_metrics_report_every_sample():
 
     assert metrics.tolist() == pytest.approx([0.03, 0.03])
     assert env.insert_delay_metrics().numel() == 0
+
+
+@pytest.mark.parametrize("joint_logprob", [False, True])
+@pytest.mark.parametrize("ignore_last", [False, True])
+def test_openpi_ogpo_uses_ppo_sampling_and_saved_steps(
+    monkeypatch, joint_logprob, ignore_last
+):
+    """OGPO groups preserve PPO noise selection, likelihoods, and gradients."""
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.openpi_rlinf.modules.model import (
+        IMAGE_KEYS,
+        Observation,
+    )
+    from rlinf.models.embodiment.openpi_rlinf.sampling import rl_sampler
+    from rlinf.models.embodiment.openpi_rlinf.tasks import rl
+    from rlinf.models.embodiment.openpi_rlinf.tasks.ogpo import (
+        Pi0OGPO,
+        Pi0OGPOConfig,
+    )
+
+    class ToyPi0OGPO(Pi0OGPO):
+        # Replace pretrained networks/transforms, retaining the production
+        # sampling, candidate grouping, and actor recompute implementations.
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.slope = torch.nn.Parameter(torch.tensor(0.2))
+            self.state_proj = torch.nn.Identity()
+            self.num_steps = 4
+            self.action_horizon = 3
+            self.model_action_dim = 2
+            self.action_chunk = 2
+            self.action_env_dim = 1
+            self.ogpo_cfg = Pi0OGPOConfig()
+            self.rl_cfg = rl.Pi0RLConfig(
+                noise_method="flow_sde",
+                noise_level=0.5,
+                joint_logprob=joint_logprob,
+                ignore_last=ignore_last,
+                train_expert_only=True,
+            )
+
+        def _observation(self, obs):
+            return obs["observation"]
+
+        def build_prefix_cache(self, observation):
+            prefix = observation.state[:, None]
+            mask = torch.ones(prefix.shape[:2], dtype=torch.bool)
+            return prefix, mask, (prefix,)
+
+        def run_suffix(self, observation, actions, time, cache, mask):
+            return self.slope * actions + time[:, None, None]
+
+        def velocity_from_suffix(self, suffix):
+            return suffix
+
+        def decode_actions(self, actions, state):
+            return actions[:, : self.action_chunk, : self.action_env_dim]
+
+    selected_ranges = []
+
+    def choose_last_eligible(low, high):
+        selected_ranges.append((low, high))
+        return high
+
+    monkeypatch.setattr(rl.random, "randint", choose_last_eligible)
+    model = ToyPi0OGPO()
+    batch_size, num_samples = 2, 3
+    observation = Observation(
+        images={key: torch.zeros(batch_size, 224, 224, 3) for key in IMAGE_KEYS},
+        image_masks={key: torch.ones(batch_size, dtype=torch.bool) for key in IMAGE_KEYS},
+        state=torch.zeros(batch_size, 2),
+        tokenized_prompt=torch.zeros(batch_size, 2, dtype=torch.long),
+        tokenized_prompt_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+    )
+    noise = torch.randn(
+        num_samples * batch_size, model.action_horizon, model.model_action_dim,
+        generator=torch.Generator().manual_seed(11),
+    )
+    with torch.no_grad():
+        candidates, chains, denoise_inds, old_logprobs = model(
+            forward_type=ForwardType.OGPO_SAMPLE,
+            obs={"observation": observation},
+            num_samples=num_samples,
+            noise=noise,
+            rng=torch.Generator().manual_seed(17),
+        )
+        repeated = model._repeat_observation(observation, num_samples)
+        _, ppo = model._predict_train(
+            repeated, noise=noise, rng=torch.Generator().manual_seed(17),
+            compute_values=False,
+        )
+    assert old_logprobs.shape == (num_samples, batch_size, 2, 1)
+    torch.testing.assert_close(chains.flatten(0, 1), ppo["forward_inputs"]["chains"])
+    torch.testing.assert_close(old_logprobs.flatten(0, 1), ppo["prev_logprobs"])
+    torch.testing.assert_close(
+        candidates, chains[:, :, -1, :2, :1].reshape(num_samples, batch_size, -1)
+    )
+    if joint_logprob:
+        assert not selected_ranges
+        expected = torch.arange(model.num_steps).expand_as(denoise_inds)
+    else:
+        chosen = model.num_steps - (2 if ignore_last else 1)
+        assert selected_ranges == [(0, chosen), (0, chosen)]
+        expected = torch.full_like(denoise_inds, chosen)
+        flat_chains = chains.flatten(0, 1)
+        for step in range(model.num_steps):
+            if step == chosen:
+                continue
+            actions = flat_chains[:, step]
+            time = torch.full((actions.shape[0],), 1 - step / model.num_steps)
+            velocity = model.slope.detach() * actions + time[:, None, None]
+            ode_mean, _ = rl_sampler.sample_mean_var(
+                actions, velocity, torch.full((actions.shape[0],), step),
+                noise_method="flow_ode", noise_level=0.5, num_steps=model.num_steps,
+            )
+            torch.testing.assert_close(flat_chains[:, step + 1], ode_mean)
+    torch.testing.assert_close(denoise_inds, expected)
+
+    def unexpected_resampling(*args):
+        raise AssertionError("Actor recompute must reuse saved denoise_inds")
+
+    monkeypatch.setattr(rl.random, "randint", unexpected_resampling)
+    output = model(
+        forward_type=ForwardType.OGPO_LOG_PROB,
+        obs={"observation": observation}, chains=chains, denoise_inds=denoise_inds,
+    )
+    torch.testing.assert_close(output["logprobs"], old_logprobs)
+    assert output["entropy"].shape == (num_samples, batch_size, 1)
+    output["logprobs"].sum().backward()
+    assert model.slope.grad is not None
+    assert torch.isfinite(model.slope.grad)
+    assert model.slope.grad.abs() > 0
+
+    forward_inputs = dict(ppo["forward_inputs"])
+    forward_inputs["obs_state"] = repeated.state
+    forward_inputs.update({f"obs_image__{k}": v for k, v in repeated.images.items()})
+    forward_inputs.update(
+        {f"obs_image_mask__{k}": v for k, v in repeated.image_masks.items()}
+    )
+    ppo_recomputed = model.default_forward(forward_inputs, compute_values=False)
+    torch.testing.assert_close(
+        output["logprobs"].flatten(0, 1), ppo_recomputed["logprobs"]
+    )
+    model.zero_grad()
+    predicted, target = model(
+        forward_type=ForwardType.OGPO_BC,
+        obs={"observation": observation},
+        actions=torch.zeros(batch_size, model.action_chunk, model.action_env_dim),
+    )
+    assert predicted.shape == target.shape == (batch_size, 3, 2)
+    (predicted[:, :2, :1] - target[:, :2, :1]).square().mean().backward()
+    assert model.slope.grad is not None
+    assert torch.isfinite(model.slope.grad)
+
+
+@pytest.mark.parametrize(
+    ("logprob_type", "coordinates_per_ratio"),
+    [("token_level", 1), ("action_level", 2), ("chunk_level", 4)],
+)
+def test_openpi_ogpo_coordinate_loss_uses_ppo_aggregation(
+    logprob_type, coordinates_per_ratio
+):
+    """A chunk advantage broadcasts after PPO sums the requested coordinates."""
+    from rlinf.algorithms.registry import policy_loss
+
+    # Two candidates for one replay observation, with opposite Q advantages.
+    logprobs = torch.full((2, 1, 2, 2), 0.08, requires_grad=True)
+    old_logprobs = torch.zeros_like(logprobs)
+    advantages = torch.tensor([[1.0], [-1.0]])
+    loss, _ = policy_loss(
+        task_type="embodied", loss_type="actor",
+        logprob_type=logprob_type, reward_type="chunk_level",
+        single_action_dim=2,
+        logprobs=logprobs.flatten(0, 1),
+        old_logprobs=old_logprobs.flatten(0, 1),
+        advantages=advantages.reshape(-1),
+        loss_mask=torch.ones(2, dtype=torch.bool),
+        clip_ratio_low=0.1, clip_ratio_high=0.1,
+    )
+    ratio = torch.exp(torch.tensor(0.08 * coordinates_per_ratio))
+    expected = (ratio - ratio.clamp(max=1.1)) / 2
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert torch.all(logprobs.grad[1] > 0)
+    if coordinates_per_ratio > 1:
+        assert torch.count_nonzero(logprobs.grad[0]) == 0
+    else:
+        assert torch.all(logprobs.grad[0] < 0)
+
+
+@pytest.mark.parametrize(
+    ("options", "actor_path", "critic_path"),
+    [
+        (["--checkpoint", "/shared"], "/shared", "/shared"),
+        (["--ckpt", "/shared", "--actor-checkpoint", "/good"], "/good", "/shared"),
+        (["--checkpoint", "/shared", "--critic-checkpoint", "/bad"], "/shared", "/bad"),
+        (["--actor-checkpoint", "/good", "--critic-checkpoint", "/bad"], "/good", "/bad"),
+    ],
+)
+def test_ogpo_visualization_checkpoint_sources(options, actor_path, critic_path):
+    from toolkits.ogpo.visualize_q_rollout import parse_args
+
+    args = parse_args([*options, "--episodes", "3"])
+    assert args.actor_checkpoint == Path(actor_path)
+    assert args.critic_checkpoint == Path(critic_path)
+    assert args.critic_device == args.device
+
+
+def test_ogpo_visualization_requires_both_checkpoint_sources():
+    from toolkits.ogpo.visualize_q_rollout import parse_args
+
+    with pytest.raises(SystemExit) as error:
+        parse_args(["--actor-checkpoint", "/good", "--episodes", "1"])
+    assert error.value.code == 2
+
+
+class _VisualizationCritic:
+    """Tiny numerical critic with checkpoint-specific action stats and features."""
+
+    action_chunk = 2
+    action_env_dim = 1
+    device = torch.device("cpu")
+
+    def encode_replay_actions(self, obs, actions):
+        return (actions - obs["states"][:, None, :]) / 2.0
+
+    def sac_q_forward(self, obs, actions):
+        value = 10.0 * obs["states"][:, 0] + actions.sum(dim=-1)
+        return torch.stack((value, 2.0 * value), dim=-1)
+
+
+@pytest.mark.parametrize(
+    ("negate_space", "expected_negated", "expected_q"),
+    [
+        ("normalized", [-1.0, -2.0], [[13.0, 26.0], [7.0, 14.0]]),
+        ("env", [-2.0, -3.0], [[13.0, 26.0], [5.0, 10.0]]),
+    ],
+)
+def test_ogpo_visualization_uses_critic_coordinates_and_features(
+    negate_space, expected_negated, expected_q
+):
+    from toolkits.ogpo.visualize_q_rollout import score_actions
+
+    critic = _VisualizationCritic()
+    obs = {"states": torch.tensor([[1.0]])}
+    commands = torch.tensor([[[3.0], [5.0]]])
+    # Actor coordinates intentionally differ from critic normalization. Passing
+    # them straight to Q would produce the wrong values for both heads.
+    actor_coordinates = torch.tensor([[30.0, 50.0]])
+    with torch.inference_mode():
+        action, negated, values = score_actions(
+            object(), critic, obs, commands, actor_coordinates, negate_space
+        )
+    torch.testing.assert_close(action, torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(negated, torch.tensor([expected_negated]))
+    torch.testing.assert_close(torch.from_numpy(values), torch.tensor(expected_q))
+    torch.testing.assert_close(commands, torch.tensor([[[3.0], [5.0]]]))
+
+
+def test_ogpo_visualization_shared_model_preserves_original_coordinates():
+    from toolkits.ogpo.visualize_q_rollout import score_actions
+
+    model = _VisualizationCritic()
+    with torch.inference_mode():
+        action, negated, values = score_actions(
+            model, model, {"states": torch.tensor([[1.0]])},
+            torch.tensor([[[3.0], [5.0]]]), torch.tensor([[30.0, 50.0]]),
+            "normalized",
+        )
+    torch.testing.assert_close(action, torch.tensor([[30.0, 50.0]]))
+    torch.testing.assert_close(negated, -action)
+    torch.testing.assert_close(
+        torch.from_numpy(values), torch.tensor([[90.0, 180.0], [-70.0, -140.0]])
+    )
+
+
+def test_ogpo_visualization_rejects_different_action_chunks():
+    from toolkits.ogpo.visualize_q_rollout import validate_model_pair
+
+    actor = SimpleNamespace(action_chunk=5, action_env_dim=7)
+    critic = SimpleNamespace(action_chunk=10, action_env_dim=7)
+    with pytest.raises(ValueError, match="differs from critic"):
+        validate_model_pair(actor, critic)

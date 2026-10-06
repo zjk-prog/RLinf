@@ -868,3 +868,251 @@ def test_clear_stub_import_preserves_real_flash_attn_module():
     Patcher.clear_stub_import("flash_attn")
 
     assert sys.modules["flash_attn"] is real_flash_attn
+
+
+@pytest.mark.parametrize("phase", ["train", "eval"])
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize(
+    ("replay_mode", "stop_on_done"),
+    [("openpi_chunk", False), ("flow_atomic", False), ("flow_atomic", True), (None, False)],
+)
+def test_env_worker_chunk_step_contract(phase, terminal, replay_mode, stop_on_done):
+    """Train/eval preserve each environment's chunk API and terminal outputs."""
+    import inspect
+
+    import torch
+
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    actions = torch.zeros(2, 3, 7)
+    obs = {"states": torch.ones(2, 7)}
+    final_obs = {"states": torch.full((2, 7), 2.0)}
+    rewards = torch.ones(2, 3)
+    terminations = torch.zeros(2, 3, dtype=torch.bool)
+    terminations[0, -1] = terminal
+    truncations = torch.zeros_like(terminations)
+    success = torch.tensor([terminal, False])
+    calls = []
+
+    def result(chunk_actions):
+        torch.testing.assert_close(torch.as_tensor(chunk_actions), actions)
+        info = {"episode": {"success_once": success}}
+        if terminal:
+            info.update(
+                final_observation=final_obs,
+                final_info={"episode": {"success_once": success}},
+            )
+        if replay_mode == "flow_atomic":
+            info["_raw_chunk_terminations"] = terminations.clone()
+            info["_raw_chunk_truncations"] = truncations.clone()
+        return [obs], rewards, terminations, truncations, [info]
+
+    class LiberoChunkEnv:
+        def chunk_step(self, chunk_actions):
+            calls.append(None)
+            return result(chunk_actions)
+
+    class ManiSkillChunkEnv:
+        def chunk_step(self, chunk_actions, *, stop_on_done):
+            calls.append(stop_on_done)
+            return result(chunk_actions)
+
+    is_flow = replay_mode == "flow_atomic"
+    env = ManiSkillChunkEnv() if is_flow else LiberoChunkEnv()
+    env_cfg = {
+        "env_type": "maniskill" if is_flow else "libero",
+        "auto_reset": True,
+        "ignore_terminations": False,
+        "stop_on_done": stop_on_done,
+    }
+    worker = SimpleNamespace(
+        cfg=OmegaConf.create({"env": {"train": env_cfg, "eval": env_cfg}}),
+        model_cfg=OmegaConf.create(
+            {
+                "model_type": "flow_policy" if is_flow else "openpi_rlinf",
+                "num_action_chunks": 3,
+                "action_dim": 7,
+                "policy_setup": "panda",
+            }
+        ),
+        env_list=[env],
+        eval_env_list=[env],
+        _is_ogpo=replay_mode is not None,
+        _is_openpi_chunk_ogpo=replay_mode == "openpi_chunk",
+        use_external_reward_model=False,
+        eval_prev_done=[torch.zeros(2, dtype=torch.bool)],
+    )
+    if phase == "train":
+        output, metrics, payload = inspect.unwrap(EnvWorker.env_interact_step)(
+            worker, actions, 0
+        )
+        torch.testing.assert_close(output.rewards, rewards)
+        torch.testing.assert_close(output.dones, terminations)
+        if replay_mode is not None:
+            torch.testing.assert_close(payload["raw_terminations"], terminations)
+            torch.testing.assert_close(payload["raw_truncations"], truncations)
+            torch.testing.assert_close(payload["success"], success)
+    else:
+        output, metrics = inspect.unwrap(EnvWorker.env_evaluate_step)(
+            worker, actions, 0
+        )
+    expected_stop = (True if phase == "eval" else stop_on_done) if is_flow else None
+    assert calls == [expected_stop]
+    torch.testing.assert_close(output.obs["states"], obs["states"])
+    if terminal:
+        torch.testing.assert_close(output.final_obs["states"], final_obs["states"])
+        torch.testing.assert_close(metrics["success_once"], success[:1])
+    else:
+        assert output.final_obs is None
+        assert metrics == {}
+
+
+@pytest.mark.parametrize("horizon", [5, 20])
+@pytest.mark.parametrize(
+    ("boundary", "boundary_index", "bootstrap"),
+    [
+        ("none", None, True),
+        ("termination", -1, False),
+        ("truncation", -1, True),
+        ("both", -1, False),
+        ("termination", 1, False),
+        ("truncation", 1, True),
+    ],
+)
+def test_openpi_ogpo_critic_environment_step_targets(
+    horizon, boundary, boundary_index, bootstrap
+):
+    """Discount per environment step and bootstrap through time limits only."""
+    import inspect
+
+    import torch
+
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.workers.actor.fsdp_ogpo_policy_worker import EmbodiedOGPOFSDPPolicy
+
+    class ConstantQPolicy(torch.nn.Module):
+        def __init__(self, values):
+            super().__init__()
+            self.values = torch.nn.Parameter(torch.tensor(values))
+
+        def forward(self, *, forward_type, obs, actions=None, num_samples=None):
+            if forward_type == ForwardType.OGPO_SAMPLE:
+                return torch.zeros(1, 1, horizon * 7), None, None, None
+            assert forward_type == ForwardType.SAC_Q
+            return self.values.unsqueeze(0)
+
+    worker = object.__new__(EmbodiedOGPOFSDPPolicy)
+    worker.is_openpi_chunk_ogpo = True
+    worker.cfg = OmegaConf.create({"algorithm": {"gamma": 0.9}})
+    worker.ogpo_cfg = OmegaConf.create({"td_q_aggregation": "mean"})
+    worker.q_sample_generator = torch.Generator().manual_seed(0)
+    worker.model = ConstantQPolicy([0.25, 0.75])
+    worker.target_model = ConstantQPolicy([2.0, 4.0])
+    rewards = torch.arange(1, horizon + 1, dtype=torch.float32).unsqueeze(0)
+    terminations = torch.zeros(1, horizon, dtype=torch.bool)
+    truncations = torch.zeros_like(terminations)
+    if boundary in ("termination", "both"):
+        terminations[0, boundary_index] = True
+    if boundary in ("truncation", "both"):
+        truncations[0, boundary_index] = True
+    batch = {
+        "curr_obs": {"states": torch.zeros(1, 7)},
+        "next_obs": {"states": torch.ones(1, 7)},
+        "actions": torch.zeros(1, horizon, 7),
+        "rewards": rewards,
+        "terminations": terminations,
+        "dones": terminations | truncations,
+        "valid": torch.ones(1, dtype=torch.bool),
+    }
+    loss, metrics = inspect.unwrap(EmbodiedOGPOFSDPPolicy.forward_critic)(worker, batch)
+    length = horizon if boundary_index in (None, -1) else boundary_index + 1
+    discounted_reward = sum((i + 1) * 0.9**i for i in range(length))
+    expected_target = discounted_reward + (0.9**length * 3.0 if bootstrap else 0)
+    expected_loss = ((0.25 - expected_target) ** 2 + (0.75 - expected_target) ** 2) / 2
+    torch.testing.assert_close(
+        metrics["critic/target_q_mean"], torch.tensor(expected_target)
+    )
+    torch.testing.assert_close(loss, torch.tensor(expected_loss))
+    loss.backward()
+    torch.testing.assert_close(
+        worker.model.values.grad, worker.model.values.detach() - expected_target
+    )
+    assert worker.target_model.values.grad is None
+
+
+@pytest.mark.parametrize(
+    ("global_step", "update_step", "warmup", "critic_only", "epochs"),
+    [
+        (0, 160, 20, False, 8),
+        (19, 152, 20, False, 8),
+        (20, 0, 20, False, 8),
+        (21, 0, 20, False, 1),
+        (0, 0, 0, False, 1),
+        (20, 160, 20, True, 8),
+        (99, 999, 100, False, 8),
+        (100, 0, 100, False, 8),
+    ],
+)
+def test_ogpo_warmup_uses_runner_global_step(
+    global_step, update_step, warmup, critic_only, epochs
+):
+    """Actor updates follow runner steps regardless of internal update count."""
+    import copy
+    import inspect
+
+    import torch
+
+    from rlinf.workers.actor.fsdp_ogpo_policy_worker import EmbodiedOGPOFSDPPolicy
+
+    class TinyPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.actor = torch.nn.Parameter(torch.ones(()))
+            self.q_head = torch.nn.Parameter(torch.ones(()))
+
+        def clip_grad_norm_(self, max_norm):
+            return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
+
+    class WarmupWorker(EmbodiedOGPOFSDPPolicy):
+        def __init__(self):
+            self.model = TinyPolicy()
+            self.target_model = copy.deepcopy(self.model).requires_grad_(False)
+            self.critic_only = critic_only
+            self.update_step = update_step
+            self.ogpo_cfg = OmegaConf.create(
+                {"q_warmup_steps": warmup, "q_utd": 4, "pi_utd": 1}
+            )
+            self.cfg = OmegaConf.create(
+                {
+                    "actor": {
+                        "optim": {"clip_grad": 100},
+                        "critic_optim": {"clip_grad": 100},
+                    }
+                }
+            )
+            self.optimizer = torch.optim.SGD([self.model.actor], lr=0.1)
+            self.qf_optimizer = torch.optim.SGD([self.model.q_head], lr=0.1)
+            self.lr_scheduler = None
+            self.qf_lr_scheduler = None
+
+        def _sample_train_micro_batches(self):
+            return [{"actions": torch.zeros(1, 1)}]
+
+        def forward_critic(self, batch):
+            loss = self.model.q_head.square()
+            return loss, {"critic/loss": loss.detach()}
+
+        def forward_actor(self, batch):
+            loss = self.model.actor.square()
+            return loss, {"actor/loss": loss.detach()}
+
+    worker = WarmupWorker()
+    inspect.unwrap(EmbodiedOGPOFSDPPolicy.set_global_step)(worker, global_step)
+    for _ in range(epochs):
+        metrics = inspect.unwrap(EmbodiedOGPOFSDPPolicy.update_one_epoch)(worker)
+        should_update = not critic_only and global_step >= warmup
+        assert ("actor/grad_norm" in metrics) == should_update
+        worker.update_step += 1
+    expected_actor = 0.8**epochs if should_update else 1.0
+    torch.testing.assert_close(worker.model.actor, torch.tensor(expected_actor))
+    torch.testing.assert_close(worker.model.q_head, torch.tensor(0.8 ** (4 * epochs)))

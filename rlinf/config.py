@@ -1118,45 +1118,116 @@ def validate_embodied_cfg(cfg):
         )
 
     if not only_eval and cfg.algorithm.loss_type == "embodied_ogpo":
-        assert model_type == SupportedModel.FLOW_POLICY, (
-            "embodied_ogpo requires actor.model.model_type=flow_policy"
-        )
         assert cfg.actor.training_backend == "fsdp"
         assert cfg.rollout.backend == "huggingface"
         assert not cfg.runner.get("use_training_pipeline", False)
         assert not cfg.get("reward", {}).get("use_reward_model", False)
-        assert cfg.env.train.env_type == "maniskill"
-        assert cfg.env.eval.env_type == "maniskill"
-        assert cfg.env.train.init_params.get("obs_mode") == "state"
-        assert cfg.env.eval.init_params.get("obs_mode") == "state"
-        assert cfg.actor.model.get("input_type") == "state"
-        assert cfg.actor.model.get("flow_actor_type") == "OGPOFlowActor"
-        assert cfg.actor.model.get("add_q_head", False)
-        assert cfg.actor.model.get("q_head_type", "default") == "default"
-        assert cfg.actor.model.get("denoising_steps", 0) >= 2
-        assert not cfg.actor.model.get("use_batch_norm", False)
-        assert not cfg.actor.model.get("noise_std_head", False)
-        assert cfg.algorithm.get("group_size", 0) > 1
         ogpo_cfg = cfg.algorithm.ogpo
-        assert ogpo_cfg.get("constant_noise_std", 0.0) > 0
-        assert ogpo_cfg.get("train_best_of_n", 0) > 0
-        assert ogpo_cfg.get("eval_best_of_n", 0) > 0
-        assert ogpo_cfg.get("q_utd", 0) > 0
-        assert ogpo_cfg.get("pi_utd", 0) > 0
+        replay_mode = str(ogpo_cfg.get("replay_mode", "flow_atomic"))
+        if model_type == SupportedModel.FLOW_POLICY:
+            assert replay_mode == "flow_atomic"
+            assert cfg.env.train.env_type == "maniskill"
+            assert cfg.env.eval.env_type == "maniskill"
+            assert cfg.env.train.init_params.get("obs_mode") == "state"
+            assert cfg.env.eval.init_params.get("obs_mode") == "state"
+            assert cfg.actor.model.get("input_type") == "state"
+            assert cfg.actor.model.get("flow_actor_type") == "OGPOFlowActor"
+            assert cfg.actor.model.get("add_q_head", False)
+            assert cfg.actor.model.get("q_head_type", "default") == "default"
+            assert cfg.actor.model.get("denoising_steps", 0) >= 2
+            assert not cfg.actor.model.get("use_batch_norm", False)
+            assert not cfg.actor.model.get("noise_std_head", False)
+            assert cfg.algorithm.get("group_size", 0) > 1
+            assert ogpo_cfg.get("constant_noise_std", 0.0) > 0
+            assert ogpo_cfg.get("train_best_of_n", 0) > 0
+            assert ogpo_cfg.get("eval_best_of_n", 0) > 0
+            assert ogpo_cfg.get("q_utd", 0) > 0
+            assert ogpo_cfg.get("pi_utd", 0) > 0
+        elif model_type == SupportedModel.OPENPI_RLINF:
+            assert replay_mode == "openpi_chunk"
+            assert cfg.env.train.env_type == "libero"
+            assert cfg.env.eval.env_type == "libero"
+            assert cfg.actor.model.openpi.get("task") == "ogpo"
+            assert cfg.actor.model.openpi.get("config_name") == "pi0_libero"
+            assert int(cfg.actor.model.num_action_chunks) > 0
+            assert int(cfg.actor.model.openpi.action_chunk) == int(
+                cfg.actor.model.num_action_chunks
+            )
+            assert int(cfg.actor.model.openpi.action_env_dim) == int(
+                cfg.actor.model.action_dim
+            )
+            assert cfg.algorithm.get("group_size", 0) > 1
+            openpi_cfg = cfg.actor.model.openpi
+            assert openpi_cfg.get("noise_method", "flow_sde") in {
+                "flow_sde", "flow_cps", "flow_noise"
+            }, "OpenPI OGPO requires a stochastic PPO noise method"
+            if openpi_cfg.get("noise_method", "flow_sde") != "flow_noise":
+                assert float(openpi_cfg.get("noise_level", 0.5)) > 0
+            assert cfg.algorithm.logprob_type in {
+                "token_level", "action_level", "chunk_level"
+            }
+            assert cfg.algorithm.reward_type == "chunk_level"
+            assert cfg.algorithm.clip_ratio_low >= 0
+            assert cfg.algorithm.clip_ratio_high >= 0
+            assert cfg.algorithm.entropy_bonus >= 0
+            assert cfg.algorithm.entropy_type in {"token_level", "chunk_level"}, (
+                "Pi0 returns one entropy value per sample"
+            )
+            obsolete_options = {
+                "normalize_denoising_horizon", "normalize_action_dimension",
+                "clip_randn", "randn_clip_value", "use_tapered_noise",
+                "ignore_last", "error_correct_sde_to_ode",
+                "clip_intermediate_actions", "ode_clip_intermediate_actions",
+                "denoised_clip_value", "clip_epsilon", "entropy_coeff",
+            }
+            assert not obsolete_options.intersection(ogpo_cfg), (
+                "OpenPI OGPO uses actor.model.openpi PPO sampling options and "
+                "algorithm.clip_ratio_low/high/entropy_bonus, not Flow OGPO options"
+            )
+            assert ogpo_cfg.get("q_utd", 0) >= 0, (
+                "OpenPI OGPO requires q_utd >= 0; use 0 for actor-only updates"
+            )
+            critic_only = bool(ogpo_cfg.get("critic_only", False))
+            assert ogpo_cfg.get("pi_utd", 0) >= 0
+            assert critic_only or ogpo_cfg.get("pi_utd", 0) > 0
+            assert 0.0 <= float(ogpo_cfg.get("actor_tau", 0.005)) <= 1.0
+            assert 0.0 <= float(ogpo_cfg.get("critic_tau", 0.03)) <= 1.0
+            if critic_only:
+                assert ogpo_cfg.get("q_utd", 0) > 0, (
+                    "OpenPI OGPO critic_only requires q_utd > 0"
+                )
+                assert float(ogpo_cfg.get("actor_tau", 0.0)) == 0.0
+            chunk_size = int(cfg.actor.model.num_action_chunks)
+            assert int(cfg.env.train.max_episode_steps) % chunk_size == 0
+            assert int(cfg.env.train.max_steps_per_rollout_epoch) % chunk_size == 0
+            assert int(cfg.env.eval.max_episode_steps) % chunk_size == 0
+            assert int(cfg.env.eval.max_steps_per_rollout_epoch) % chunk_size == 0
+            assert int(ogpo_cfg.get("min_success_chunks", 1)) > 0
+            assert int(ogpo_cfg.get("bc_refine_updates", 0)) == 0
+            assert "train_best_of_n" not in ogpo_cfg
+            assert "eval_best_of_n" not in ogpo_cfg
+            assert not any(str(key).startswith("bon_") for key in ogpo_cfg)
+        else:
+            raise AssertionError(
+                "embodied_ogpo supports flow_policy/flow_atomic or "
+                "openpi_rlinf/openpi_chunk only"
+            )
         assert ogpo_cfg.get("td_q_aggregation", "mean") in {
             "mean", "min", "subsample"
         }
         assert ogpo_cfg.get("advantage_q_strategy", "vanilla") in {
             "vanilla", "conservative", "penultimate"
         }
-        assert ogpo_cfg.get("q_loss_type", "mse") in {"mse", "huber"}
+        if replay_mode == "flow_atomic":
+            assert ogpo_cfg.get("q_loss_type", "mse") in {"mse", "huber"}
         assert not cfg.rollout.get("enable_cuda_graph", False)
         assert not cfg.rollout.get("enable_torch_compile", False)
-        num_action_chunks = int(cfg.actor.model.num_action_chunks)
-        for env_name in ("train", "eval"):
-            env_cfg = cfg.env[env_name]
-            assert int(env_cfg.max_episode_steps) % num_action_chunks == 0
-            assert int(env_cfg.max_steps_per_rollout_epoch) % num_action_chunks == 0
+        if replay_mode == "flow_atomic":
+            num_action_chunks = int(cfg.actor.model.num_action_chunks)
+            for env_name in ("train", "eval"):
+                env_cfg = cfg.env[env_name]
+                assert int(env_cfg.max_episode_steps) % num_action_chunks == 0
+                assert int(env_cfg.max_steps_per_rollout_epoch) % num_action_chunks == 0
 
     # MolmoAct2 caches an action queue per batch index inside the LeRobot policy.
     # Pipeline stages hand the same indices to different environments on

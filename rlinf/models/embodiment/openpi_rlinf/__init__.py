@@ -181,6 +181,61 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             state_indices=OmegaConf.select(model_cfg, "state_indices", default=None),
         )
         _install_transforms(model, cfg, config_name)
+    elif task == "ogpo":
+        from rlinf.models.embodiment.openpi_rlinf.tasks.ogpo import (
+            Pi0OGPO,
+            Pi0OGPOConfig,
+        )
+        from rlinf.models.embodiment.openpi_rlinf.tasks.rl import Pi0RLConfig
+
+        config_name = _require_config_name(model_cfg, task)
+        critic_gemma3 = OmegaConf.select(model_cfg, "critic_gemma3", default={})
+        ogpo_model_cfg = Pi0OGPOConfig(
+            train_expert_only=bool(
+                OmegaConf.select(model_cfg, "train_expert_only", default=True)
+            ),
+            num_q_heads=int(OmegaConf.select(cfg, "num_q_heads", default=2)),
+            critic_prefix_length=int(
+                OmegaConf.select(model_cfg, "critic_prefix_length", default=816)
+            ),
+            critic_mlp_hidden_dims=tuple(
+                int(x)
+                for x in OmegaConf.select(
+                    model_cfg, "critic_mlp_hidden_dims", default=[128, 64]
+                )
+            ),
+            critic_gemma3=dict(critic_gemma3 or {}),
+        )
+        model = Pi0OGPO(
+            pi0_config,
+            **runtime,
+            config_name=config_name,
+            state_indices=OmegaConf.select(model_cfg, "state_indices", default=None),
+            ogpo_cfg=ogpo_model_cfg,
+            rl_cfg=Pi0RLConfig(
+                noise_method=str(
+                    OmegaConf.select(model_cfg, "noise_method", default="flow_sde")
+                ),
+                noise_level=float(
+                    OmegaConf.select(model_cfg, "noise_level", default=0.5)
+                ),
+                noise_logvar_range=tuple(
+                    float(x)
+                    for x in OmegaConf.select(
+                        model_cfg, "noise_logvar_range", default=[0.08, 0.16]
+                    )
+                ),
+                joint_logprob=bool(
+                    OmegaConf.select(model_cfg, "joint_logprob", default=False)
+                ),
+                ignore_last=bool(
+                    OmegaConf.select(model_cfg, "ignore_last", default=False)
+                ),
+                train_expert_only=ogpo_model_cfg.train_expert_only,
+                config_name=config_name,
+            ),
+        )
+        _install_transforms(model, cfg, config_name)
     elif task == "dagger":
         from rlinf.models.embodiment.openpi_rlinf.tasks.dagger import Pi0DAgger
 
@@ -237,7 +292,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     else:
         raise ValueError(
             f"actor.model.openpi.task={task!r} is not supported; "
-            "use 'eval', 'sft', 'rl', 'dagger', or 'dsrl'."
+            "use 'eval', 'sft', 'rl', 'ogpo', 'dagger', or 'dsrl'."
         )
 
     if full_weights_path is not None:
@@ -278,6 +333,15 @@ def _freeze_after_load(model, task: str) -> None:
             logger.info(
                 "openpi_rlinf[rl]: train_expert_only=True; froze %d parameter "
                 "tensors (SigLIP + gemma expert-0) after weight load",
+                frozen,
+            )
+        return
+    if task == "ogpo" and getattr(model, "ogpo_cfg", None) is not None:
+        if model.ogpo_cfg.train_expert_only:
+            frozen = model.freeze_vlm()
+            logger.info(
+                "openpi_rlinf[ogpo]: froze %d VLM parameter tensors after weight "
+                "load; action expert and Q heads remain trainable",
                 frozen,
             )
         return

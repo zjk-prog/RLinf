@@ -275,6 +275,25 @@ LIBERO 结果
 
 .. _zh-liberopro-plus-benchmark:
 
+OpenPI OGPO 的环境语义
+----------------------------------------
+
+设置检查点路径后，运行：
+
+.. code-block:: bash
+
+    bash examples/embodiment/run_embodiment.sh libero_object_ogpo_openpi_rlinf
+
+该示例固定使用 ``specific_reset_id: 0``，每次 reset 都选择 task 0（将 alphabet soup 放入篮子）的第 0 份初始状态。有序 reset 配置不会覆盖这个显式 ID。
+
+设置 ``use_rel_reward: false`` 和 ``use_only_first_success: true`` 时，首次成功的环境步获得配置的成功奖励，同一 chunk 内之后的奖励清零。环境仍执行完整个 chunk。启用自动 reset 时，termination 和 truncation 标记集中在 chunk 最后一项，replay 保存 reset 前的最终观测。
+
+OpenPI OGPO critic 按环境步累计折扣奖励。有效 chunk 长度为 ``L`` 时，TD target 为折扣奖励之和加上 ``gamma**L * Q_target(next_obs, next_action)``。真正的 termination 去掉 bootstrap 项；时间上限导致的 truncation 保留该项。已报告 done 之后的奖励不再累计。实际执行的 chunk 长度属于训练配置，当前示例每个 chunk 执行 5 个动作。
+
+Warmup 按 runner 从 0 开始的 global step 计数，与 TensorBoard 横轴一致。设置 ``q_warmup_steps: 20`` 时，step 0～19 仅更新 critic，从 step 20 的训练阶段开始更新 actor；该边界不受 ``update_epoch`` 和 ``q_utd`` 影响。恢复训练时，runner 会在训练前同步恢复后的 global step。目标网络更新频率仍按内部更新次数计数。
+
+``critic/reward_chunk_sum`` 记录未折扣的 chunk 奖励之和，``critic/reward_chunk_discounted`` 记录实际进入 TD target 的折扣奖励项。
+
 LIBERO-Pro 与 LIBERO-Plus 套件
 ----------------------------------------
 

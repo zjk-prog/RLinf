@@ -277,6 +277,42 @@ RL models use ``do_sample = True`` and ``temperature_train = 1.6`` in ``rollout.
      - +55.35%
      - +55.76%
 
+OpenPI OGPO environment semantics
+---------------------------------
+
+After configuring the checkpoint path, run:
+
+.. code-block:: bash
+
+    bash examples/embodiment/run_embodiment.sh libero_object_ogpo_openpi_rlinf
+
+The example fixes ``specific_reset_id: 0``: every reset selects task 0
+(alphabet soup into the basket), trial 0. Ordered reset selection does not
+override this explicit ID.
+
+With ``use_rel_reward: false`` and ``use_only_first_success: true``, the
+first successful step earns the configured success reward; later rewards in
+the same chunk are zero. All actions in the chunk still execute. With
+automatic reset enabled, termination and truncation flags are reported at
+the final chunk slot, and replay retains the observation before reset.
+
+The OpenPI OGPO critic discounts rewards per environment step. For a valid
+chunk length ``L``, its target is the discounted reward sum plus
+``gamma**L * Q_target(next_obs, next_action)``. True termination removes the
+bootstrap term; a time-limit truncation retains it. Rewards after a reported
+done are excluded. The execution chunk length remains a training setting;
+the example currently executes five actions per chunk.
+
+Warmup uses the runner's zero-based global step, matching the TensorBoard
+step axis. With ``q_warmup_steps: 20``, steps 0 through 19 update only the
+critic; actor updates start during training at step 20. This boundary is
+independent of ``update_epoch`` and ``q_utd``. On resume, the runner restores
+the global step before training. Internal update counts still control target
+network update frequencies.
+
+``critic/reward_chunk_sum`` reports the undiscounted chunk reward.
+``critic/reward_chunk_discounted`` reports the reward term used in the TD target.
+
 .. _liberopro-plus-benchmark:
 
 LIBERO-Pro & LIBERO-Plus Suites

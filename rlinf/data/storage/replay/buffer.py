@@ -772,6 +772,29 @@ class TrajectoryReplayBuffer:
         """Return the number of transition starts in the active sample window."""
         return self._get_sampling_window(success_only)[2]
 
+    def sample_transitions(
+        self, batch_size: int, *, success_only: bool = False
+    ) -> dict[str, torch.Tensor]:
+        """Sample independent transitions without adding a sequence dimension."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        window_ids, cumulative_ends, total_samples = self._get_sampling_window(
+            success_only
+        )
+        if not window_ids or cumulative_ends is None or total_samples == 0:
+            qualifier = " successful" if success_only else ""
+            raise RuntimeError(f"Cannot sample from an empty{qualifier} buffer window.")
+        sample_ids = torch.randint(
+            0, total_samples, (batch_size,), generator=self.random_generator
+        )
+        bucket_indices = torch.bucketize(sample_ids, cumulative_ends, right=True)
+        starts = torch.cat([torch.zeros(1, dtype=torch.long), cumulative_ends[:-1]])
+        trajectory_ids = torch.as_tensor(
+            [window_ids[int(index)] for index in bucket_indices], dtype=torch.long
+        )
+        local_indices = sample_ids - starts[bucket_indices]
+        return self._gather_samples(trajectory_ids, local_indices)
+
     def _gather_samples(
         self,
         traj_ids_tensor: torch.Tensor,

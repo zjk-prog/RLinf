@@ -87,6 +87,12 @@ class EnvWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
         self._is_ogpo = self.cfg.algorithm.loss_type == "embodied_ogpo"
+        self._ogpo_replay_mode = str(
+            self.cfg.algorithm.get("ogpo", {}).get("replay_mode", "flow_atomic")
+        )
+        self._is_openpi_chunk_ogpo = (
+            self._is_ogpo and self._ogpo_replay_mode == "openpi_chunk"
+        )
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
@@ -162,7 +168,7 @@ class EnvWorker(Worker):
                 self.cfg.env.train.total_num_envs // self._world_size // self.stage_num
             )
             self.train_batch_size = self.cfg.env.train.total_num_envs // self.stage_num
-            if self._is_ogpo:
+            if self._is_ogpo and not self._is_openpi_chunk_ogpo:
                 self._ogpo_pending_steps = [
                     [[] for _ in range(self.train_num_envs_per_stage)]
                     for _ in range(self.stage_num)
@@ -523,7 +529,8 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
-        if self._is_ogpo:
+        # Only Flow OGPO uses ManiSkill's early-stop API; LIBERO executes full chunks.
+        if self._is_ogpo and not self._is_openpi_chunk_ogpo:
             chunk_step_result = self.env_list[stage_id].chunk_step(
                 chunk_actions,
                 stop_on_done=bool(self.cfg.env.train.get("stop_on_done", False)),
@@ -565,12 +572,18 @@ class EnvWorker(Worker):
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
         if self._is_ogpo:
-            raw_chunk_terminations = infos.pop("_raw_chunk_terminations", None)
-            raw_chunk_truncations = infos.pop("_raw_chunk_truncations", None)
-            if raw_chunk_terminations is None or raw_chunk_truncations is None:
-                raise RuntimeError(
-                    "OGPO requires raw per-step termination data from ManiSkill"
-                )
+            if self._is_openpi_chunk_ogpo:
+                # LIBERO runs the full chunk and reports a chunk boundary at its
+                # final slot when auto-reset is enabled.
+                raw_chunk_terminations = chunk_terminations
+                raw_chunk_truncations = chunk_truncations
+            else:
+                raw_chunk_terminations = infos.pop("_raw_chunk_terminations", None)
+                raw_chunk_truncations = infos.pop("_raw_chunk_truncations", None)
+                if raw_chunk_terminations is None or raw_chunk_truncations is None:
+                    raise RuntimeError(
+                        "Flow OGPO requires raw per-step termination data from ManiSkill"
+                    )
             success = torch.zeros(chunk_dones.shape[0], dtype=torch.bool)
             episode_info = None
             if isinstance(infos.get("final_info"), dict):
@@ -648,7 +661,8 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        if self._is_ogpo:
+        # Only Flow OGPO uses ManiSkill's early-stop API; LIBERO executes full chunks.
+        if self._is_ogpo and not self._is_openpi_chunk_ogpo:
             chunk_step_result = self.eval_env_list[stage_id].chunk_step(
                 chunk_actions, stop_on_done=True
             )
@@ -1193,6 +1207,17 @@ class EnvWorker(Worker):
         **kwargs,
     ) -> None:
         """Split a policy action chunk into episode-scoped atomic transitions."""
+        if self._is_openpi_chunk_ogpo:
+            self._record_openpi_chunk_transition(
+                stage_id,
+                curr_obs,
+                env_output,
+                policy_output,
+                raw_terminations=raw_terminations,
+                raw_truncations=raw_truncations,
+                success=success,
+            )
+            return
         policy_actions = policy_output.forward_inputs.get("action")
         if policy_actions is None:
             raise ValueError("OGPO rollout must return the policy action chunk")
@@ -1241,6 +1266,90 @@ class EnvWorker(Worker):
                     )
                     self._ogpo_pending_steps[stage_id][env_index] = []
                     break
+
+    def _record_openpi_chunk_transition(
+        self,
+        stage_id: int,
+        curr_obs: dict[str, Any],
+        env_output: EnvOutput,
+        policy_output: PolicyOutput,
+        *,
+        raw_terminations: torch.Tensor,
+        raw_truncations: torch.Tensor,
+        success: torch.Tensor,
+    ) -> None:
+        """Store one complete model-space chunk as one replay transition."""
+        forward_inputs = policy_output.forward_inputs
+        model_action = forward_inputs.get("model_action")
+        prompt = forward_inputs.get("tokenized_prompt")
+        prompt_mask = forward_inputs.get("tokenized_prompt_mask")
+        if model_action is None or prompt is None or prompt_mask is None:
+            raise ValueError(
+                "OpenPI OGPO rollout must return model_action and tokenized prompt tensors"
+            )
+        chunk_size = int(self.model_cfg.num_action_chunks)
+        env_dim = int(self.model_cfg.action_dim)
+        model_dim = int(self.model_cfg.openpi.model_action_dim)
+        horizon = int(self.model_cfg.openpi.action_horizon)
+        batch_size = model_action.shape[0]
+        full_action = model_action.reshape(batch_size, horizon, model_dim)
+        chunk_actions = full_action[:, :chunk_size, :env_dim]
+        rewards = env_output.rewards
+        if rewards.ndim == 3:
+            rewards = rewards.squeeze(-1)
+        terminations = raw_terminations.bool()
+        truncations = raw_truncations.bool()
+        dones = torch.logical_or(terminations, truncations)
+
+        for env_index in range(batch_size):
+            terminal = bool(dones[env_index].any())
+            next_source = (
+                env_output.final_obs
+                if terminal and env_output.final_obs is not None
+                else env_output.obs
+            )
+            version = (
+                policy_output.versions[env_index].reshape(-1)[:1]
+                if policy_output.versions is not None
+                else torch.zeros(1, dtype=torch.float32)
+            )
+            success_at_chunk = bool(success[env_index])
+            trajectory = Trajectory(
+                max_episode_length=1,
+                actions=chunk_actions[env_index : env_index + 1, None].detach().cpu(),
+                rewards=rewards[env_index : env_index + 1, None].detach().cpu(),
+                terminations=terminations[env_index : env_index + 1, None].cpu(),
+                truncations=truncations[env_index : env_index + 1, None].cpu(),
+                dones=dones[env_index : env_index + 1, None].cpu(),
+                versions=version.reshape(1, 1, -1).detach().cpu(),
+                is_success=torch.full((1, 1, 1), success_at_chunk, dtype=torch.bool),
+                forward_inputs={
+                    "tokenized_prompt": prompt[env_index : env_index + 1]
+                    .detach()
+                    .cpu()
+                    .unsqueeze(0),
+                    "tokenized_prompt_mask": prompt_mask[
+                        env_index : env_index + 1
+                    ]
+                    .detach()
+                    .cpu()
+                    .unsqueeze(0),
+                },
+                curr_obs={
+                    key: value.unsqueeze(0).unsqueeze(0)
+                    for key, value in self._ogpo_replay_obs(
+                        curr_obs, env_index
+                    ).items()
+                },
+                next_obs={
+                    key: value.unsqueeze(0).unsqueeze(0)
+                    for key, value in self._ogpo_replay_obs(
+                        next_source, env_index
+                    ).items()
+                },
+            )
+            trajectory.model_weights_id = get_model_weights_id(trajectory.versions)
+            self._ogpo_completed_episodes[stage_id].append(trajectory)
 
     async def _send_ogpo_episodes(
         self, episodes: list[Trajectory], channel: Channel

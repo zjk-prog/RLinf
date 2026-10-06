@@ -34,7 +34,12 @@ from rlinf.scheduler import Channel, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
-from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
+from rlinf.utils.utils import (
+    clear_memory,
+    collect_param_names_need_sync,
+    masked_mean,
+    reshape_entropy,
+)
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 
@@ -49,6 +54,13 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         self.qf_lr_scheduler = None
         self.update_step = 0
         self.ogpo_cfg = self.cfg.algorithm.get("ogpo", {})
+        self.is_openpi_chunk_ogpo = (
+            self.cfg.actor.model.model_type == "openpi_rlinf"
+            and self.ogpo_cfg.get("replay_mode", "flow_atomic") == "openpi_chunk"
+        )
+        self.critic_only = self.is_openpi_chunk_ogpo and bool(
+            self.ogpo_cfg.get("critic_only", False)
+        )
 
     def init_worker(self) -> None:
         self.setup_model_and_optimizer()
@@ -62,6 +74,11 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         online_module = self.model_provider_func()
         target_module = self.model_provider_func()
         self.param_names_need_sync = collect_param_names_need_sync(target_module)
+        if self.critic_only:
+            for module in (online_module, target_module):
+                for name, param in module.named_parameters():
+                    if "q_head" not in name:
+                        param.requires_grad_(False)
         self.model = self._strategy.wrap_model(
             model=online_module, device_mesh=self._device_mesh
         )
@@ -73,16 +90,28 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         if self.torch_dtype is None:
             self.torch_dtype = next(self.model.parameters()).dtype
 
-        optimizers = self.build_optimizers(
-            model=self.model,
-            main_optim_config=self.cfg.actor.optim,
-            param_filters={"critic": ["q_head"]},
-            filtered_optim_config={"critic": self.cfg.actor.critic_optim},
-        )
-        self.optimizer, self.qf_optimizer = optimizers
-        self.lr_scheduler = self.build_lr_scheduler(
-            self.optimizer, self.cfg.actor.optim
-        )
+        self.optimizer = None
+        self.lr_scheduler = None
+        if self.critic_only:
+            (self.qf_optimizer,) = self.build_optimizers(
+                model=self.model,
+                main_optim_config=self.cfg.actor.critic_optim,
+                param_filters={},
+                filtered_optim_config={},
+            )
+            # FSDPModelManager's offload hooks operate on `self.optimizer`.
+            # Alias it to the sole critic optimizer; no actor optimizer is built.
+            self.optimizer = self.qf_optimizer
+        else:
+            self.optimizer, self.qf_optimizer = self.build_optimizers(
+                model=self.model,
+                main_optim_config=self.cfg.actor.optim,
+                param_filters={"critic": ["q_head"]},
+                filtered_optim_config={"critic": self.cfg.actor.critic_optim},
+            )
+            self.lr_scheduler = self.build_lr_scheduler(
+                self.optimizer, self.cfg.actor.optim
+            )
         self.qf_lr_scheduler = self.build_lr_scheduler(
             self.qf_optimizer, self.cfg.actor.critic_optim
         )
@@ -195,6 +224,20 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         success_only: bool = False,
     ) -> list[dict[str, Any]]:
         per_rank_batch = self.cfg.actor.global_batch_size // self._world_size
+        if self.is_openpi_chunk_ogpo:
+            batch = self.replay_buffer.sample_transitions(
+                per_rank_batch, success_only=success_only
+            )
+            batch["valid"] = torch.ones(
+                per_rank_batch, dtype=torch.bool
+            )
+            actual_batch_size = int(batch["actions"].shape[0])
+            micro_batch_size = int(self.cfg.actor.micro_batch_size)
+            split_count = max(1, ceil(actual_batch_size / micro_batch_size))
+            return [
+                put_tensor_device(micro_batch, device=self.device)
+                for micro_batch in split_dict_to_chunk(batch, split_count)
+            ]
         batch = self._sample_sequences(per_rank_batch, success_only=success_only)
         actual_batch_size = int(batch["actions"].shape[0])
         micro_batch_size = int(self.cfg.actor.micro_batch_size)
@@ -273,6 +316,8 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
 
     @Worker.timer("ogpo_forward_critic")
     def forward_critic(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict]:
+        if self.is_openpi_chunk_ogpo:
+            return self._forward_openpi_chunk_critic(batch)
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
         actions = batch["actions"].reshape(batch["actions"].shape[0], -1)
@@ -347,7 +392,93 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         metrics["critic/total_loss"] = td_loss.detach()
         return td_loss, metrics
 
+    @staticmethod
+    def _openpi_replay_obs(batch: dict[str, Any], key: str) -> dict[str, Any]:
+        obs = dict(batch[key])
+        obs.update(
+            {
+                name: value
+                for name, value in batch.get("forward_inputs", {}).items()
+                if name in {"tokenized_prompt", "tokenized_prompt_mask"}
+            }
+        )
+        return obs
+
+    def _forward_openpi_chunk_critic(
+        self, batch: dict[str, Any]
+    ) -> tuple[torch.Tensor, dict]:
+        curr_obs = self._openpi_replay_obs(batch, "curr_obs")
+        next_obs = self._openpi_replay_obs(batch, "next_obs")
+        actions = batch["actions"].float()
+        batch_size = actions.shape[0]
+        rewards = batch["rewards"].float().reshape(batch_size, -1)
+        dones = batch["dones"].bool().reshape(batch_size, -1)
+        terminations = batch["terminations"].bool().reshape(batch_size, -1)
+        if rewards.shape != dones.shape or rewards.shape != terminations.shape:
+            raise ValueError("OpenPI chunk rewards, dones and terminations must match")
+        if rewards.shape[1] == 0:
+            raise ValueError("OpenPI critic requires a non-empty action chunk")
+        # Include the boundary step; later rewards belong outside this transition.
+        done_prefix = dones.cumsum(dim=1)
+        step_valid = torch.cat(
+            [
+                torch.ones_like(done_prefix[:, :1], dtype=torch.bool),
+                done_prefix[:, :-1] == 0,
+            ],
+            dim=1,
+        )
+        gamma = float(self.cfg.algorithm.gamma)
+        steps = torch.arange(
+            rewards.shape[1], device=rewards.device, dtype=rewards.dtype
+        )
+        discounted_rewards = (rewards * step_valid * (gamma**steps)[None]).sum(dim=-1)
+        bootstrap_discount = gamma ** step_valid.sum(dim=-1).float()
+        terminated = (terminations & step_valid).any(dim=-1)
+        valid = batch["valid"].bool()
+        with torch.no_grad():
+            next_actions, _, _, _ = self.target_model(
+                forward_type=ForwardType.OGPO_SAMPLE,
+                obs=next_obs,
+                num_samples=1,
+            )
+            next_q_heads = self.target_model(
+                forward_type=ForwardType.SAC_Q,
+                obs=next_obs,
+                actions=next_actions[0],
+            )
+            # Time limits still bootstrap from the pre-reset final observation.
+            target_q = discounted_rewards + (
+                (~terminated) * bootstrap_discount * self._aggregate_q(next_q_heads)
+            )
+        q_values = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=curr_obs,
+            actions=actions.flatten(start_dim=1),
+        ).float()
+        td_loss, metrics = compute_q_td_loss(
+            q_values,
+            target_q,
+            loss_type="mse",
+            valid_mask=valid,
+        )
+        metrics["critic/reward_chunk_sum"] = rewards.sum(dim=-1).mean().detach()
+        metrics["critic/reward_chunk_discounted"] = discounted_rewards.mean().detach()
+        metrics["critic/total_loss"] = td_loss.detach()
+        return td_loss, metrics
+
     def _get_bc_batch(self, batch_size: int) -> dict[str, Any] | None:
+        if self.is_openpi_chunk_ogpo:
+            if float(self.ogpo_cfg.get("bc_coeff", 0.0)) <= 0:
+                return None
+            if (
+                self.replay_buffer.get_sampleable_count(success_only=True)
+                < int(self.ogpo_cfg.get("min_success_chunks", 1))
+            ):
+                return None
+            batch = self.replay_buffer.sample_transitions(
+                batch_size, success_only=True
+            )
+            return put_tensor_device(batch, device=self.device)
         if self.replay_buffer.get_sampleable_count(success_only=True) > 0:
             batch = self._sample_sequences(batch_size, success_only=True)
             return put_tensor_device(batch, device=self.device)
@@ -358,6 +489,23 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
     ) -> tuple[torch.Tensor | None, dict]:
         if batch is None:
             return None, {}
+        if self.is_openpi_chunk_ogpo:
+            min_chunks = int(self.ogpo_cfg.get("min_success_chunks", 1))
+            if int(batch["actions"].shape[0]) < min_chunks:
+                return None, {}
+            actions = batch["actions"].float()
+            predicted_velocity, target_velocity = self.model(
+                forward_type=ForwardType.OGPO_BC,
+                obs=self._openpi_replay_obs(batch, "curr_obs"),
+                actions=actions,
+            )
+            valid_mask = torch.zeros_like(predicted_velocity, dtype=torch.bool)
+            valid_mask[:, : actions.shape[1], : actions.shape[2]] = True
+            return compute_flow_matching_bc_loss(
+                predicted_velocity,
+                target_velocity,
+                valid_mask=valid_mask,
+            )
         actions = batch["actions"].reshape(
             batch["actions"].shape[0],
             int(self.cfg.actor.model.num_action_chunks),
@@ -387,6 +535,8 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         *,
         bc_only: bool = False,
     ) -> tuple[torch.Tensor, dict]:
+        if self.is_openpi_chunk_ogpo:
+            return self._forward_openpi_chunk_actor(batch, bc_only=bc_only)
         batch_size = batch["actions"].shape[0]
         bc_batch = self._get_bc_batch(batch_size)
         bc_loss, bc_metrics = self._compute_bc_loss(bc_batch)
@@ -483,6 +633,83 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         metrics["actor/advantage_mean"] = advantages.mean().detach()
         return loss, metrics
 
+    @Worker.timer("ogpo_forward_openpi_actor")
+    def _forward_openpi_chunk_actor(
+        self, batch: dict[str, Any], *, bc_only: bool = False
+    ) -> tuple[torch.Tensor, dict]:
+        bc_coeff = float(self.ogpo_cfg.get("bc_coeff", 0.0))
+        bc_batch = self._get_bc_batch(batch["actions"].shape[0]) if bc_coeff else None
+        bc_loss, bc_metrics = self._compute_bc_loss(bc_batch)
+        if bc_only:
+            if bc_loss is None:
+                return torch.zeros((), device=self.device), {}
+            return bc_loss, bc_metrics
+
+        obs = self._openpi_replay_obs(batch, "curr_obs")
+        with torch.no_grad():
+            candidates, chains, denoise_inds, old_logprobs = self.target_model(
+                forward_type=ForwardType.OGPO_SAMPLE,
+                obs=obs,
+                num_samples=int(self.cfg.algorithm.group_size),
+            )
+            q_ensemble = self.target_model(
+                forward_type=ForwardType.SAC_Q,
+                obs=obs,
+                actions=candidates,
+            ).float()
+            q_values = self._aggregate_q(q_ensemble)
+            advantages = compute_group_q_advantages(
+                q_values=q_values,
+                q_ensemble=q_ensemble,
+                strategy=self.ogpo_cfg.get("advantage_q_strategy", "conservative"),
+                normalize_group=bool(self.ogpo_cfg.get("normalize_group", True)),
+                advantage_min=self.ogpo_cfg.get("advantage_min"),
+                group_dim=0,
+            ).detach()
+        output = self.model(
+            forward_type=ForwardType.OGPO_LOG_PROB,
+            obs=obs,
+            chains=chains,
+            denoise_inds=denoise_inds,
+        )
+        # PPO expects one leading batch axis and per-coordinate log-probabilities.
+        logprobs = output["logprobs"].flatten(0, 1).float()
+        old_logprobs = old_logprobs.flatten(0, 1).float()
+        valid = batch["valid"].bool().reshape(-1)
+        valid = valid.unsqueeze(0).expand(candidates.shape[0], -1).reshape(-1)
+        loss, metrics = policy_loss(
+            task_type="embodied",
+            loss_type="actor",
+            logprob_type=self.cfg.algorithm.logprob_type,
+            reward_type="chunk_level",
+            single_action_dim=int(self.cfg.actor.model.action_dim),
+            logprobs=logprobs,
+            old_logprobs=old_logprobs,
+            advantages=advantages.reshape(-1).float(),
+            loss_mask=valid,
+            clip_ratio_low=float(self.cfg.algorithm.clip_ratio_low),
+            clip_ratio_high=float(self.cfg.algorithm.clip_ratio_high),
+        )
+        entropy_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
+        if self.cfg.algorithm.entropy_bonus > 0:
+            entropy = reshape_entropy(
+                output["entropy"].flatten(0, 1),
+                entropy_type=self.cfg.algorithm.entropy_type,
+                action_dim=int(self.cfg.actor.model.action_dim),
+                batch_size=logprobs.shape[0],
+            )
+            entropy_mask = valid.reshape(-1, *([1] * (entropy.ndim - 1)))
+            entropy_loss = masked_mean(entropy, mask=entropy_mask)
+            loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
+        if bc_loss is not None:
+            loss = loss + bc_coeff * bc_loss
+        metrics.update(bc_metrics)
+        metrics["actor/entropy_loss"] = entropy_loss.detach()
+        metrics["actor/total_loss"] = loss.detach()
+        metrics["actor/q_mean"] = q_values.mean().detach()
+        metrics["actor/advantage_mean"] = advantages.mean().detach()
+        return loss, metrics
+
     def _micro_batch_update(
         self,
         optimizer: torch.optim.Optimizer,
@@ -514,7 +741,8 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             return None
         grad_norm = self.model.clip_grad_norm_(max_norm=clip_grad)
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         return metrics, grad_norm
 
     @Worker.timer("ogpo_update_one_epoch")
@@ -571,7 +799,8 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
                 append_to_dict(metrics, success_critic_metrics)
 
         q_warmup_steps = int(self.ogpo_cfg.get("q_warmup_steps", 0))
-        if self.update_step >= q_warmup_steps:
+        # set_global_step() stores the runner's global step in self.version.
+        if not self.critic_only and self.version >= q_warmup_steps:
             for _ in range(int(self.ogpo_cfg.get("pi_utd", 1))):
                 micro_batches = self._sample_train_micro_batches()
                 actor_update = self._micro_batch_update(
@@ -586,21 +815,6 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
                 actor_metrics, actor_grad = actor_update
                 actor_metrics["actor/grad_norm"] = actor_grad
                 append_to_dict(metrics, actor_metrics)
-
-            for _ in range(int(self.ogpo_cfg.get("bc_refine_updates", 0))):
-                bc_update = self._micro_batch_update(
-                    self.optimizer,
-                    self.lr_scheduler,
-                    micro_batches,
-                    lambda micro_batch: self.forward_actor(
-                        micro_batch, bc_only=True
-                    ),
-                    float(self.cfg.actor.optim.clip_grad),
-                )
-                if bc_update is not None:
-                    bc_metrics, bc_grad = bc_update
-                    bc_metrics["actor/bc_refine_grad_norm"] = bc_grad
-                    append_to_dict(metrics, bc_metrics)
 
         if self.update_step % int(
             self.ogpo_cfg.get("critic_target_update_freq", 1)
@@ -677,8 +891,16 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             self.is_optimizer_offloaded = False
         self._strategy.save_checkpoint(
             model=self.model,
-            optimizers=[self.optimizer, self.qf_optimizer],
-            lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
+            optimizers=(
+                [self.qf_optimizer]
+                if self.critic_only
+                else [self.optimizer, self.qf_optimizer]
+            ),
+            lr_schedulers=(
+                [self.qf_lr_scheduler]
+                if self.critic_only
+                else [self.lr_scheduler, self.qf_lr_scheduler]
+            ),
             save_path=save_base_path,
             checkpoint_format=(
                 "local_shard"
@@ -698,7 +920,11 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             os.path.join(target_path, f"checkpoint_rank_{self._rank}.pt"),
         )
         torch.save(
-            {"update_step": self.update_step},
+            {
+                "update_step": self.update_step,
+                "critic_only": self.critic_only,
+                "replay_mode": self.ogpo_cfg.get("replay_mode", "flow_atomic"),
+            },
             os.path.join(component_path, f"state_rank_{self._rank}.pt"),
         )
         if self.cfg.algorithm.replay_buffer.get("save_buffer_checkpoint", True):
@@ -709,10 +935,23 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             )
 
     def load_checkpoint(self, load_base_path: str) -> None:
+        """Restore OGPO state after bringing offloaded parameters onto the device."""
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
         self._strategy.load_checkpoint(
             model=self.model,
-            optimizers=[self.optimizer, self.qf_optimizer],
-            lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
+            optimizers=(
+                [self.qf_optimizer]
+                if self.critic_only
+                else [self.optimizer, self.qf_optimizer]
+            ),
+            lr_schedulers=(
+                [self.qf_lr_scheduler]
+                if self.critic_only
+                else [self.lr_scheduler, self.qf_lr_scheduler]
+            ),
             load_path=load_base_path,
             checkpoint_format=(
                 "local_shard"
@@ -727,7 +966,7 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
                 "target_model",
                 f"checkpoint_rank_{self._rank}.pt",
             ),
-            map_location=self.device,
+            map_location=torch.device(f"{Worker.torch_device_type}:{self.device}"),
         )
         self._strategy.load_model_with_state_dict(
             self.target_model,
@@ -739,6 +978,13 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             os.path.join(component_path, f"state_rank_{self._rank}.pt"),
             map_location="cpu",
         )
+        if bool(state.get("critic_only", False)) != self.critic_only:
+            raise ValueError(
+                "OGPO checkpoint critic_only mode does not match current configuration"
+            )
+        checkpoint_replay_mode = state.get("replay_mode", "flow_atomic")
+        if checkpoint_replay_mode != self.ogpo_cfg.get("replay_mode", "flow_atomic"):
+            raise ValueError("OGPO checkpoint replay_mode does not match configuration")
         self.update_step = int(state.get("update_step", 0))
         if self.cfg.algorithm.replay_buffer.get("save_buffer_checkpoint", True):
             buffer_path = os.path.join(
