@@ -49,6 +49,7 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self.target_model = None
+        self.actor_ema_fp32: dict[str, torch.Tensor] = {}
         self.replay_buffer = None
         self.qf_optimizer = None
         self.qf_lr_scheduler = None
@@ -87,9 +88,24 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         )
         self.target_model.requires_grad_(False)
         self.target_model.eval()
+        self._initialize_actor_ema_fp32()
         if self.torch_dtype is None:
             self.torch_dtype = next(self.model.parameters()).dtype
 
+        self.setup_optimizers()
+
+        scaler_cfg = self.cfg.actor.fsdp_config.get("grad_scaler", {})
+        scaler_kwargs = {
+            key: scaler_cfg[key]
+            for key in ("init_scale", "growth_interval")
+            if scaler_cfg.get(key) is not None
+        }
+        self.grad_scaler = self.build_grad_scaler(
+            scaler_cfg.get("enabled", False), **scaler_kwargs
+        )
+
+    def setup_optimizers(self) -> None:
+        """Create fresh optimizers and LR schedulers from the current config."""
         self.optimizer = None
         self.lr_scheduler = None
         if self.critic_only:
@@ -114,16 +130,6 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             )
         self.qf_lr_scheduler = self.build_lr_scheduler(
             self.qf_optimizer, self.cfg.actor.critic_optim
-        )
-
-        scaler_cfg = self.cfg.actor.fsdp_config.get("grad_scaler", {})
-        scaler_kwargs = {
-            key: scaler_cfg[key]
-            for key in ("init_scale", "growth_interval")
-            if scaler_cfg.get(key) is not None
-        }
-        self.grad_scaler = self.build_grad_scaler(
-            scaler_cfg.get("enabled", False), **scaler_kwargs
         )
 
     def _new_buffer(self, name: str) -> TrajectoryReplayBuffer:
@@ -176,6 +182,52 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         """Add complete episodes to the replay buffer."""
         self.replay_buffer.add_trajectories(episodes)
 
+    def _initialize_actor_ema_fp32(self) -> None:
+        """Keep BF16 actor EMA residuals outside the sampling model."""
+        self.actor_ema_fp32 = {}
+        for (name, online), (target_name, target) in zip(
+            self.model.named_parameters(),
+            self.target_model.named_parameters(),
+            strict=True,
+        ):
+            if name != target_name:
+                raise RuntimeError(
+                    f"Online/target parameter mismatch: {name} != {target_name}"
+                )
+            if (
+                online.requires_grad
+                and "q_head" not in name
+                and target.dtype == torch.bfloat16
+            ):
+                if self.cfg.actor.fsdp_config.sharding_strategy != "no_shard":
+                    raise ValueError("BF16 actor FP32 EMA requires no_shard")
+                self.actor_ema_fp32[name] = target.detach().float().clone()
+
+    @torch.no_grad()
+    def _restore_actor_ema_fp32(self, state: dict[str, Any]) -> None:
+        """Restore residuals, or initialize legacy checkpoints from loaded target."""
+        self._initialize_actor_ema_fp32()
+        if "actor_ema_fp32" not in state:
+            if self.actor_ema_fp32:
+                self.log_on_first_rank(
+                    "Legacy OGPO checkpoint has no FP32 actor EMA; initializing "
+                    "from restored target weights. Previous rounding residuals "
+                    "cannot be recovered."
+                )
+            return
+        saved = state["actor_ema_fp32"]
+        if not isinstance(saved, dict) or saved.keys() != self.actor_ema_fp32.keys():
+            raise ValueError("OGPO checkpoint FP32 actor EMA parameter names mismatch")
+        for name, accumulator in self.actor_ema_fp32.items():
+            value = saved[name]
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.dtype != torch.float32
+                or value.shape != accumulator.shape
+            ):
+                raise ValueError(f"Invalid OGPO checkpoint FP32 actor EMA: {name}")
+            accumulator.copy_(value.to(device=accumulator.device))
+
     @torch.no_grad()
     def update_target_models(
         self,
@@ -193,7 +245,9 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             else critic_tau
         )
         for (online_name, online_param), (target_name, target_param) in zip(
-            self.model.named_parameters(), self.target_model.named_parameters()
+            self.model.named_parameters(),
+            self.target_model.named_parameters(),
+            strict=True,
         ):
             if online_name != target_name:
                 raise RuntimeError(
@@ -201,7 +255,20 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
                 )
             is_critic = "q_head" in online_name
             tau = critic_tau if is_critic else actor_tau
-            target_param.data.lerp_(online_param.data, tau)
+            if tau == 0.0:
+                continue
+            accumulator = self.actor_ema_fp32.get(online_name)
+            if accumulator is None:
+                if tau == 1.0:
+                    target_param.copy_(online_param)
+                else:
+                    target_param.lerp_(online_param, tau)
+            else:
+                if tau == 1.0:
+                    accumulator.copy_(online_param)
+                else:
+                    accumulator.lerp_(online_param.detach().float(), tau)
+                target_param.copy_(accumulator)
 
     def get_rollout_state_dict(self) -> dict[str, torch.Tensor]:
         return self._strategy.get_model_state_dict(
@@ -924,6 +991,10 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
                 "update_step": self.update_step,
                 "critic_only": self.critic_only,
                 "replay_mode": self.ogpo_cfg.get("replay_mode", "flow_atomic"),
+                "actor_ema_fp32": {
+                    name: value.detach().cpu()
+                    for name, value in self.actor_ema_fp32.items()
+                },
             },
             os.path.join(component_path, f"state_rank_{self._rank}.pt"),
         )
@@ -935,7 +1006,12 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
             )
 
     def load_checkpoint(self, load_base_path: str) -> None:
-        """Restore OGPO state after bringing offloaded parameters onto the device."""
+        """Restore OGPO state, optionally restarting optimization from current config.
+
+        runner.reset_optimizer_on_resume defaults to False. When enabled, both
+        optimizers and LR schedulers are rebuilt after checkpoint restoration;
+        model weights, EMA, replay state, and training counters stay restored.
+        """
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
@@ -986,6 +1062,7 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
         if checkpoint_replay_mode != self.ogpo_cfg.get("replay_mode", "flow_atomic"):
             raise ValueError("OGPO checkpoint replay_mode does not match configuration")
         self.update_step = int(state.get("update_step", 0))
+        self._restore_actor_ema_fp32(state)
         if self.cfg.algorithm.replay_buffer.get("save_buffer_checkpoint", True):
             buffer_path = os.path.join(
                 component_path, "replay_buffer", f"rank_{self._rank}"
@@ -997,3 +1074,10 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedFSDPActor):
                     "Skipping replay_buffer restore: checkpoint directory does not "
                     f"exist at {buffer_path}."
                 )
+
+        if self.cfg.runner.get("reset_optimizer_on_resume", False):
+            self.setup_optimizers()
+            self.log_on_first_rank(
+                "Rebuilt OGPO optimizers and LR schedulers from current config; "
+                "optimizer moments and LR schedule progress have been reset."
+            )
