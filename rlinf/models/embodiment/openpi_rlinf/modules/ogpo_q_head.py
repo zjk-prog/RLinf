@@ -14,6 +14,7 @@
 
 """Independent OGPO Q heads conditioned on action chunks and context tokens."""
 
+import copy
 from collections.abc import Sequence
 
 import torch
@@ -45,6 +46,7 @@ class OGPOQNetwork(nn.Module):
         rope_theta: float,
         mlp_hidden_dims: Sequence[int],
         q_output_init_std: float,
+        state_input_proj: nn.Linear | None = None,
     ) -> None:
         super().__init__()
         if len(mlp_hidden_dims) != 2:
@@ -55,6 +57,9 @@ class OGPOQNetwork(nn.Module):
         self.action_proj = nn.Linear(action_dim, hidden_size)
         self.prefix_proj = nn.Linear(context_dim, hidden_size)
         self.state_proj = nn.Linear(state_dim, hidden_size)
+        # Each Q owns its raw-state encoder; the existing projection still
+        # adapts the action-expert embedding width to the critic hidden width.
+        self.state_input_proj = copy.deepcopy(state_input_proj)
         self.value_token = nn.Parameter(torch.empty(1, 1, hidden_size))
 
         gemma3_config = Gemma3TextConfig(
@@ -136,7 +141,12 @@ class OGPOQNetwork(nn.Module):
         if actions.ndim != 3 or actions.shape[2] != self.action_proj.in_features:
             raise ValueError("OGPO critic actions must have shape [B, H, A]")
         batch_size, action_chunk = actions.shape[:2]
-        expected_state_shape = (batch_size, 1, self.state_proj.in_features)
+        state_input_dim = (
+            self.state_proj.in_features
+            if self.state_input_proj is None
+            else self.state_input_proj.in_features
+        )
+        expected_state_shape = (batch_size, 1, state_input_dim)
         if tuple(state_embedding.shape) != expected_state_shape:
             raise ValueError(
                 "OGPO critic state embedding has shape "
@@ -168,7 +178,12 @@ class OGPOQNetwork(nn.Module):
         prefix_tokens = self.prefix_proj(
             condition_tokens.detach().to(dtype=network_dtype)
         )
-        state_token = self.state_proj(state_embedding.detach().to(dtype=network_dtype))
+        state_features = state_embedding.detach()
+        if self.state_input_proj is not None:
+            state_features = self.state_input_proj(
+                state_features.to(dtype=self.state_input_proj.weight.dtype)
+            )
+        state_token = self.state_proj(state_features.to(dtype=network_dtype))
         value_token = self.value_token.expand(batch_size, -1, -1)
         input_tokens = torch.cat(
             (action_tokens, prefix_tokens, state_token, value_token), dim=1

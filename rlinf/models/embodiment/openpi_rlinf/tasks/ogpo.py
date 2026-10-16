@@ -54,6 +54,7 @@ def _default_critic_gemma3_config() -> dict[str, Any]:
 class Pi0OGPOConfig:
     train_expert_only: bool = True
     num_q_heads: int = 2
+    critic_independent_state_proj: bool = False
     critic_prefix_length: int = 816
     critic_mlp_hidden_dims: tuple[int, ...] = (256, 128)
     critic_q_output_init_std: float = 1e-3
@@ -104,6 +105,9 @@ class Pi0OGPO(Pi0RL):
             num_q_heads=self.ogpo_cfg.num_q_heads,
             action_dim=self.action_env_dim,
             state_dim=action_width,
+            state_input_proj=(
+                self.state_proj if self.ogpo_cfg.critic_independent_state_proj else None
+            ),
             context_dim=context_width,
             prefix_length=self.ogpo_cfg.critic_prefix_length,
             mlp_hidden_dims=self.ogpo_cfg.critic_mlp_hidden_dims,
@@ -111,6 +115,42 @@ class Pi0OGPO(Pi0RL):
             **critic_kwargs,
         ).float()
         self._mark_fsdp_wrap_names()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Base/legacy checkpoints have no per-Q input projections. Seed them
+        # from the checkpoint's policy projection, not the random constructor.
+        # Existing per-Q weights take precedence when restoring trained critics.
+        if self.ogpo_cfg.critic_independent_state_proj:
+            for index, network in enumerate(self.q_head.qs):
+                projection_prefix = f"{prefix}q_head.qs.{index}.state_input_proj."
+                projection_keys = network.state_input_proj.state_dict().keys()
+                if not any(
+                    projection_prefix + key in state_dict for key in projection_keys
+                ):
+                    for key in projection_keys:
+                        source_key = f"{prefix}state_proj.{key}"
+                        if source_key in state_dict:
+                            state_dict[projection_prefix + key] = state_dict[
+                                source_key
+                            ].clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def setup_transforms(
         self, transforms: Sequence, output_transforms: Sequence
@@ -235,9 +275,13 @@ class Pi0OGPO(Pi0RL):
                 prefix, mask, cache = self.build_prefix_cache(observation)
         else:
             prefix, mask, cache = self.build_prefix_cache(observation)
-        # Q features never update the policy state projection.
-        with torch.no_grad():
-            state = self.state_proj(observation.state.float())[:, None]
+        # Independent critics cache the normalized raw state and project it
+        # inside each Q forward, where the critic loss can train the projection.
+        if self.ogpo_cfg.critic_independent_state_proj:
+            state = observation.state.float()[:, None]
+        else:
+            with torch.no_grad():
+                state = self.state_proj(observation.state.float())[:, None]
         return {
             "prefix": prefix.detach(),
             "mask": mask.detach(),

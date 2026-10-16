@@ -30,8 +30,12 @@ runner:
   max_steps: -1
   only_eval: false
   val_check_interval: -1
-  save_interval: 50
-  resume_dir: null
+  save_interval: 30
+  resume_dir: null #/mnt/public2/zjk/ogpo/RLinf-ogpo-restrutct/logs/20261006-02:03:15-libero_object_ogpo_openpi_rlinf/libero_object_ogpo_openpi_rlinf/checkpoints/global_step_50
+  # OGPO resume: false restores checkpoint optimizer/scheduler state.
+  # true rebuilds both from actor.optim / actor.critic_optim, clearing Adam
+  # moments and restarting LR schedules; model/EMA/training steps still resume.
+  reset_optimizer_on_resume: false
   ckpt_path: null
 
 algorithm:
@@ -41,34 +45,34 @@ algorithm:
   logprob_type: chunk_level
   entropy_type: token_level
   loss_agg_func: token-mean
-  clip_ratio_low: 0.01
-  clip_ratio_high: 0.01
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
   entropy_bonus: 0.0
   group_size: 8
-  update_epoch: 8
+  update_epoch: 4
   gamma: 0.99
   replay_buffer:
     enable_cache: true
     cache_size: 1000000
     sample_window_size: 1000000
-    min_buffer_size: 4
+    min_buffer_size: 400
     auto_save: false
     save_buffer_checkpoint: false
   ogpo:
     replay_mode: openpi_chunk
     critic_only: false
     # Runner global steps (TensorBoard steps), independent of update_epoch/q_utd.
-    q_warmup_steps: 50
+    q_warmup_steps: 20
     q_utd: 4
     pi_utd: 1
-    actor_tau: 0.005
+    actor_tau: 0.03
     critic_tau: 0.05
     actor_target_update_freq: 1
     critic_target_update_freq: 1
     td_q_aggregation: mean
     td_q_subsample_size: 2
-    advantage_q_strategy: conservative  # conservativevanilla
-    normalize_group: true
+    advantage_q_strategy: conservative   # conservative vanilla
+    normalize_group: false
     advantage_min: null
     bc_coeff: 0.0
     min_success_chunks: 1
@@ -80,8 +84,8 @@ env:
     specific_reset_id: 0
     use_fixed_reset_state_ids: true
     use_ordered_reset_state_ids: true
-    rollout_epoch: 1
-    total_num_envs: 32
+    rollout_epoch: 2
+    total_num_envs: 64
     auto_reset: true
     ignore_terminations: false
     use_only_first_success: true
@@ -114,7 +118,7 @@ env:
 rollout:
   group_name: RolloutGroup
   backend: huggingface
-  enable_offload: true
+  enable_offload: false
   pipeline_stage_num: 1
   collect_prev_infos: false
   collect_transitions: false
@@ -126,9 +130,9 @@ actor:
   group_name: ActorGroup
   training_backend: fsdp
   micro_batch_size: 8
-  global_batch_size: 256
+  global_batch_size: 2048
   seed: 42
-  enable_offload: true
+  enable_offload: false
   model:
     model_type: openpi_rlinf
     precision: null
@@ -154,6 +158,12 @@ actor:
       model_action_dim: 32
       num_images_in_input: 2
       train_expert_only: true
+      # true: each Q owns a raw-state projection initialized from the loaded
+      # policy state_proj, trained by critic_optim and EMA-updated by critic_tau.
+      # false (default if omitted): use the detached policy state embedding;
+      # its projection follows the actor optimizer and actor_tau.
+      # Keep this setting unchanged when resuming a full training checkpoint.
+      critic_independent_state_proj: true
       critic_gemma3:
         hidden_size: 384
         intermediate_size: 768

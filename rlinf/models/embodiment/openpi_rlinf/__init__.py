@@ -195,6 +195,11 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
                 OmegaConf.select(model_cfg, "train_expert_only", default=True)
             ),
             num_q_heads=int(OmegaConf.select(cfg, "num_q_heads", default=2)),
+            critic_independent_state_proj=bool(
+                OmegaConf.select(
+                    model_cfg, "critic_independent_state_proj", default=False
+                )
+            ),
             critic_prefix_length=int(
                 OmegaConf.select(model_cfg, "critic_prefix_length", default=816)
             ),
